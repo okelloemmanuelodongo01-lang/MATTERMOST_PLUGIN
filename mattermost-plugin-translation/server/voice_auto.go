@@ -308,27 +308,51 @@ func (p *Plugin) transcribeBytesDetailed(post *model.Post, data []byte, fileName
 	}
 
 	ctx := context.Background()
-	savedHint := ""
-	if post != nil {
-		savedHint = p.mediaLanguageFromPost(post)
-	}
+	candidates := p.getChannelSTTLanguageCandidates(post)
 
-	result, err := p.callSTTAPI(ctx, data, fileName, mimeType, savedHint)
+	result, err := p.callSTTAPI(ctx, data, fileName, mimeType, "", candidates)
 	if err != nil {
 		return sttResult{}, err
 	}
 
-	if post != nil && post.UserId != "" && p.shouldRetryMediaSTT(post, result) {
-		senderLang := p.getUserTargetLanguage(post.UserId)
-		if senderLang != "" && !isSameLanguage(result.DetectedLanguage, senderLang) {
-			retry, retryErr := p.callSTTAPI(ctx, data, fileName, mimeType, senderLang)
-			if retryErr == nil && p.preferMediaSTTResult(retry, result, senderLang) {
-				result = retry
-			}
+	if p.shouldRetryMediaSTT(result) && normalizeLangCode(result.DetectedLanguage) != "" {
+		retry, retryErr := p.callSTTAPI(ctx, data, fileName, mimeType, result.DetectedLanguage, candidates)
+		if retryErr == nil && p.preferMediaSTTResult(retry, result, result.DetectedLanguage) {
+			result = retry
 		}
 	}
 
 	return result, nil
+}
+
+func (p *Plugin) getChannelSTTLanguageCandidates(post *model.Post) []string {
+	if post == nil {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	var codes []string
+
+	add := func(code string) {
+		normalized := normalizeLangCode(code)
+		if normalized == "" {
+			return
+		}
+		if _, ok := seen[normalized]; ok {
+			return
+		}
+		seen[normalized] = struct{}{}
+		codes = append(codes, normalized)
+	}
+
+	for _, userID := range p.getChannelMemberUserIDs(post.ChannelId) {
+		add(p.getUserTargetLanguage(userID))
+	}
+
+	if len(codes) > 8 {
+		codes = codes[:8]
+	}
+	return codes
 }
 
 func (p *Plugin) ensureSTTConfigured() error {
@@ -343,16 +367,7 @@ func (p *Plugin) ensureSTTConfigured() error {
 	return nil
 }
 
-func (p *Plugin) shouldRetryMediaSTT(post *model.Post, result sttResult) bool {
-	if post.UserId == "" {
-		return false
-	}
-
-	senderLang := normalizeLangCode(p.getUserTargetLanguage(post.UserId))
-	if senderLang == "" {
-		return false
-	}
-
+func (p *Plugin) shouldRetryMediaSTT(result sttResult) bool {
 	text := strings.TrimSpace(result.Text)
 	detected := normalizeLangCode(result.DetectedLanguage)
 
@@ -360,11 +375,7 @@ func (p *Plugin) shouldRetryMediaSTT(post *model.Post, result sttResult) bool {
 		return true
 	}
 
-	if detected != "" && detected != senderLang {
-		return true
-	}
-
-	return detected == "" && len(text) < 12
+	return detected == "" || len(text) < 10
 }
 
 func (p *Plugin) preferMediaSTTResult(retry, first sttResult, preferredLang string) bool {
@@ -402,7 +413,7 @@ func (p *Plugin) mediaLanguageFromPost(post *model.Post) string {
 	return p.mediaLanguageHintFromPost(post)
 }
 
-func (p *Plugin) callSTTAPI(ctx context.Context, audio []byte, fileName, mimeType, languageHint string) (sttResult, error) {
+func (p *Plugin) callSTTAPI(ctx context.Context, audio []byte, fileName, mimeType, languageHint string, languageCandidates []string) (sttResult, error) {
 	config := p.getConfiguration()
 	baseURL := strings.TrimRight(config.STTApiURL, "/")
 	if baseURL == "" {
@@ -430,6 +441,9 @@ func (p *Plugin) callSTTAPI(ctx context.Context, audio []byte, fileName, mimeTyp
 		}
 		if strings.TrimSpace(languageHint) != "" {
 			_ = writer.WriteField("language_hint", languageHint)
+		}
+		if len(languageCandidates) > 0 {
+			_ = writer.WriteField("language_candidates", strings.Join(languageCandidates, ","))
 		}
 		if err := writer.Close(); err != nil {
 			return sttResult{}, err

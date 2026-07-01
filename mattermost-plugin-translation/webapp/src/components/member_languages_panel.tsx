@@ -13,6 +13,7 @@ import {getCurrentUserId} from 'mattermost-redux/selectors/entities/users';
 import LanguageSelect from './language_select';
 
 import VoiceGenderSelect, {type VoiceGender} from './voice_gender_select';
+import type {ReadAloudMode} from '../reducer';
 
 import {
 
@@ -24,11 +25,14 @@ import {
 
     SET_TTS_VOICE_GENDER,
 
+    SET_READ_ALOUD_MODE,
+
     SET_USER_PUBLIC_LANGUAGE,
 
 } from '../reducer';
 
-import {languageShortCode} from '../language_labels';
+import {languageShortCode, languageCodeLabel} from '../language_labels';
+import {clearSpeakAudioCache} from '../speak_client';
 
 
 
@@ -52,6 +56,8 @@ type Props = {
 
     myVoiceGender: VoiceGender;
 
+    myReadAloudMode: ReadAloudMode;
+
     channelId: string;
 
     userLanguages: Record<string, string>;
@@ -61,6 +67,8 @@ type Props = {
     onLanguageSaved: (language: string, userId: string) => void;
 
     onVoiceGenderSaved: (gender: VoiceGender) => void;
+
+    onReadAloudModeSaved: (mode: ReadAloudMode) => void;
 
 };
 
@@ -77,6 +85,8 @@ type State = {
     savingLanguage: boolean;
 
     savingVoice: boolean;
+
+    savingReadAloudMode: boolean;
 
 };
 
@@ -108,6 +118,12 @@ function normalizeVoiceGender(value?: string): VoiceGender {
 
 
 
+function normalizeReadAloudMode(value?: string): ReadAloudMode {
+    return (value || '').trim().toLowerCase() === 'original' ? 'original' : 'receive';
+}
+
+
+
 class MemberLanguagesPanel extends React.PureComponent<Props, State> {
 
     state: State = {
@@ -121,6 +137,8 @@ class MemberLanguagesPanel extends React.PureComponent<Props, State> {
         savingLanguage: false,
 
         savingVoice: false,
+
+        savingReadAloudMode: false,
 
     };
 
@@ -212,7 +230,7 @@ class MemberLanguagesPanel extends React.PureComponent<Props, State> {
 
 
 
-    savePreferences = async (payload: {target_language?: string; tts_voice_gender?: VoiceGender}) => {
+    savePreferences = async (payload: {target_language?: string; tts_voice_gender?: VoiceGender; read_aloud_mode?: ReadAloudMode}) => {
 
         const response = await fetch(`${API_BASE}/language`, {
 
@@ -242,7 +260,7 @@ class MemberLanguagesPanel extends React.PureComponent<Props, State> {
 
 
 
-        return response.json() as Promise<{target_language?: string; tts_voice_gender?: string}>;
+        return response.json() as Promise<{target_language?: string; tts_voice_gender?: string; read_aloud_mode?: string}>;
 
     };
 
@@ -257,6 +275,8 @@ class MemberLanguagesPanel extends React.PureComponent<Props, State> {
         try {
 
             await this.savePreferences({target_language: language});
+
+            clearSpeakAudioCache();
 
 
 
@@ -292,6 +312,8 @@ class MemberLanguagesPanel extends React.PureComponent<Props, State> {
 
             const data = await this.savePreferences({tts_voice_gender: gender});
 
+            clearSpeakAudioCache();
+
             onVoiceGenderSaved(normalizeVoiceGender(data.tts_voice_gender || gender));
 
         } catch (error) {
@@ -310,11 +332,41 @@ class MemberLanguagesPanel extends React.PureComponent<Props, State> {
 
 
 
+    handleReadAloudModeChange = async (mode: ReadAloudMode) => {
+
+        const {onReadAloudModeSaved} = this.props;
+
+        this.setState({savingReadAloudMode: true, error: ''});
+
+        try {
+
+            const data = await this.savePreferences({read_aloud_mode: mode});
+
+            clearSpeakAudioCache();
+
+            onReadAloudModeSaved(normalizeReadAloudMode(data.read_aloud_mode || mode));
+
+        } catch (error) {
+
+            const message = error instanceof Error ? error.message : 'Failed to save read-aloud mode';
+
+            this.setState({error: message});
+
+        } finally {
+
+            this.setState({savingReadAloudMode: false});
+
+        }
+
+    };
+
+
+
     render() {
 
-        const {myReceiveLanguage, myVoiceGender, userLanguages} = this.props;
+        const {myReceiveLanguage, myVoiceGender, myReadAloudMode, userLanguages} = this.props;
 
-        const {members, loading, error, savingLanguage, savingVoice} = this.state;
+        const {members, loading, error, savingLanguage, savingVoice, savingReadAloudMode} = this.state;
 
 
 
@@ -362,13 +414,35 @@ class MemberLanguagesPanel extends React.PureComponent<Props, State> {
 
                     />
 
+                    <div className='translation-member-panel__label'>Read-aloud text</div>
+
+                    <select
+
+                        className='translation-language-select'
+
+                        value={myReadAloudMode}
+
+                        disabled={savingReadAloudMode}
+
+                        onChange={(event) => void this.handleReadAloudModeChange(event.target.value as ReadAloudMode)}
+
+                    >
+
+                        <option value='receive'>My language (translated)</option>
+
+                        <option value='original'>Original message language</option>
+
+                    </select>
+
                     <div className='translation-member-panel__hint-block translation-member-panel__hint-block--tight'>
 
-                        Used when you click the speaker icon on messages (Google Text-to-Speech).
+                        Speaker icon uses native Google voices. Reading in: {languageCodeLabel(myReceiveLanguage)} when set to translated mode.
 
                     </div>
 
                 </div>
+
+                <div className='translation-member-panel__members'>
 
                 <div className='translation-member-panel__title'>Channel members</div>
 
@@ -404,6 +478,8 @@ class MemberLanguagesPanel extends React.PureComponent<Props, State> {
 
                 ))}
 
+                </div>
+
             </div>
 
         );
@@ -425,6 +501,8 @@ function mapStateToProps(state: GlobalState) {
         myReceiveLanguage: getMyReceiveLanguage(pluginState, currentUserId),
 
         myVoiceGender: pluginState.ttsVoiceGender,
+
+        myReadAloudMode: pluginState.readAloudMode,
 
         channelId: getCurrentChannelId(state) || '',
 
@@ -453,6 +531,12 @@ function mapDispatchToProps(dispatch: (action: unknown) => void) {
         onVoiceGenderSaved: (gender: VoiceGender) => {
 
             dispatch({type: SET_TTS_VOICE_GENDER, gender});
+
+        },
+
+        onReadAloudModeSaved: (mode: ReadAloudMode) => {
+
+            dispatch({type: SET_READ_ALOUD_MODE, mode});
 
         },
 

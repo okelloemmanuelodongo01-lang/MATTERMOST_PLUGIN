@@ -1,7 +1,7 @@
 import React, {useCallback, useEffect, useState} from 'react';
 
 import SpeakerIcon from './speaker_icon';
-import {getActiveSpeechPostId, onSpeechStateChange, playPostSpeech, stopActiveSpeech} from '../speak_client';
+import {fetchSpeakPreview, getActiveSpeechPostId, onSpeechStateChange, playPostSpeech, stopActiveSpeech} from '../speak_client';
 
 type Props = {
     postId: string;
@@ -12,6 +12,25 @@ export default function SpeakButton({postId, className = ''}: Props) {
     const [loading, setLoading] = useState(false);
     const [playing, setPlaying] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [readingLanguage, setReadingLanguage] = useState<string | null>(null);
+
+    useEffect(() => {
+        let cancelled = false;
+        void fetchSpeakPreview(postId)
+            .then((preview) => {
+                if (!cancelled) {
+                    setReadingLanguage(preview.languageLabel);
+                }
+            })
+            .catch(() => {
+                if (!cancelled) {
+                    setReadingLanguage(null);
+                }
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [postId]);
 
     useEffect(() => {
         return onSpeechStateChange((activeId) => {
@@ -50,7 +69,9 @@ export default function SpeakButton({postId, className = ''}: Props) {
         ? 'Preparing audio'
         : playing
             ? 'Stop reading aloud'
-            : 'Read message aloud';
+            : readingLanguage
+                ? `Read message aloud (${readingLanguage})`
+                : 'Read message aloud';
 
     return (
         <span className={`translation-speak-button-wrap ${className}`.trim()}>

@@ -7,7 +7,14 @@ import {GOOGLE_SPEECH_SYNC_MAX_SECONDS, normalizeSpeechLanguageCode, toWhisperLa
 
 type Transcriber = Awaited<ReturnType<typeof pipeline>>;
 
-const WHISPER_MODEL = process.env.WHISPER_MODEL?.trim() || 'Xenova/whisper-small';
+export type TranscriptionResult = {
+  text: string;
+  detected_language: string;
+  engine: string;
+  confidence?: number;
+};
+
+const WHISPER_MODEL = process.env.WHISPER_MODEL?.trim() || 'Xenova/whisper-base';
 
 let transcriberPromise: Promise<Transcriber> | null = null;
 
@@ -61,7 +68,7 @@ function toMonoFloat32(audioData: AudioData): Float32Array {
   return merged;
 }
 
-async function decodeAudioBuffer(buffer: Buffer): Promise<{samples: Float32Array; sampleRate: number; durationSeconds: number}> {
+export async function decodeAudioBuffer(buffer: Buffer): Promise<{samples: Float32Array; sampleRate: number; durationSeconds: number}> {
   const audioData = await decode(new Uint8Array(buffer));
   const mono = toMonoFloat32(audioData);
   const samples = resampleTo16k(mono, audioData.sampleRate);
@@ -70,10 +77,9 @@ async function decodeAudioBuffer(buffer: Buffer): Promise<{samples: Float32Array
 }
 
 async function transcribeWithWhisper(
-  buffer: Buffer,
+  samples: Float32Array,
   languageHint?: string,
-): Promise<{text: string; detected_language: string; engine: string}> {
-  const {samples} = await decodeAudioBuffer(buffer);
+): Promise<TranscriptionResult> {
   const whisperLanguage = toWhisperLanguage(languageHint);
 
   const transcriber = await getTranscriber();
@@ -99,14 +105,76 @@ async function transcribeWithWhisper(
 
   return {
     text,
-    detected_language: normalizeSpeechLanguageCode(detectedLanguage) || 'auto',
-    engine: `whisper:${WHISPER_MODEL}`,
+    detected_language: normalizeSpeechLanguageCode(detectedLanguage) || '',
+    engine: whisperLanguage ? `whisper:${WHISPER_MODEL}` : `whisper-auto:${WHISPER_MODEL}`,
+    confidence: 0.78,
   };
+}
+
+async function finalizeDetectedLanguage(text: string, fallback: string): Promise<string> {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return normalizeSpeechLanguageCode(fallback);
+  }
+
+  if (isGoogleTranslateEnabled()) {
+    try {
+      const detected = await detectLanguageWithGoogle(trimmed);
+      if (detected) {
+        return normalizeSpeechLanguageCode(detected);
+      }
+    } catch {
+      // use fallback
+    }
+  }
+
+  return normalizeSpeechLanguageCode(fallback);
+}
+
+function languageMatchesHint(detected: string, hint: string): boolean {
+  const d = normalizeSpeechLanguageCode(detected);
+  const h = normalizeSpeechLanguageCode(hint);
+  if (!d || !h) {
+    return false;
+  }
+  return d === h;
+}
+
+function scoreTranscription(result: TranscriptionResult, preferredLang?: string): number {
+  const text = result.text.trim();
+  if (!text) {
+    return 0;
+  }
+
+  let score = text.length;
+  if (result.engine.startsWith('google')) {
+    score += 14;
+  }
+  if (result.engine.includes('whisper-auto')) {
+    score += 6;
+  }
+  if (typeof result.confidence === 'number') {
+    score += result.confidence * 40;
+  }
+  if (preferredLang && languageMatchesHint(result.detected_language, preferredLang)) {
+    score += 24;
+  }
+  return score;
+}
+
+function pickBestTranscription(results: TranscriptionResult[], preferredLang?: string): TranscriptionResult {
+  const usable = results.filter((entry) => entry.text.trim().length > 0);
+  if (usable.length === 0) {
+    throw new Error('No speech detected in the recording.');
+  }
+
+  usable.sort((a, b) => scoreTranscription(b, preferredLang) - scoreTranscription(a, preferredLang));
+  return usable[0];
 }
 
 export function getSpeechEngine(): string {
   if (isGoogleSpeechEnabled()) {
-    return `google-speech+whisper:${WHISPER_MODEL}`;
+    return `google-speech-auto+whisper:${WHISPER_MODEL}`;
   }
   return `whisper:${WHISPER_MODEL}`;
 }
@@ -114,35 +182,93 @@ export function getSpeechEngine(): string {
 export async function transcribeAudioBuffer(
   buffer: Buffer,
   fileName: string,
-  options?: {languageHint?: string; mimeType?: string},
-): Promise<{text: string; detected_language: string; engine: string}> {
+  options?: {languageHint?: string; mimeType?: string; languageCandidates?: string[]},
+): Promise<TranscriptionResult> {
   const mimeType = options?.mimeType || '';
   const languageHint = options?.languageHint?.trim() || '';
+  const languageCandidates = (options?.languageCandidates || [])
+    .map((code) => code.trim())
+    .filter(Boolean);
 
+  let samples: Float32Array | undefined;
   let durationSeconds = 0;
   try {
     const decoded = await decodeAudioBuffer(buffer);
+    samples = decoded.samples;
     durationSeconds = decoded.durationSeconds;
   } catch {
+    samples = undefined;
     durationSeconds = 0;
   }
 
-  const useGoogleSync = isGoogleSpeechEnabled()
-    && durationSeconds > 0
-    && durationSeconds <= GOOGLE_SPEECH_SYNC_MAX_SECONDS;
+  const results: TranscriptionResult[] = [];
+  const googleEnabled = isGoogleSpeechEnabled();
 
-  if (useGoogleSync) {
+  // Phase 1 — Whisper auto-detect (no manual language required).
+  let whisperDetected = '';
+  if (samples && samples.length > 0) {
     try {
-      return await transcribeWithGoogleSpeech(buffer, mimeType, fileName, languageHint, durationSeconds);
+      const whisperAuto = await transcribeWithWhisper(samples, undefined);
+      results.push(whisperAuto);
+      whisperDetected = whisperAuto.detected_language;
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Google Speech failed';
-      console.warn(`Google Speech failed, falling back to Whisper: ${message}`);
+      const message = error instanceof Error ? error.message : 'Whisper auto-detect failed';
+      console.warn(message);
     }
-  } else if (isGoogleSpeechEnabled() && durationSeconds > GOOGLE_SPEECH_SYNC_MAX_SECONDS) {
-    console.warn(
-      `Audio is ${Math.round(durationSeconds)}s; using Whisper for long-form STT.`,
-    );
   }
 
-  return transcribeWithWhisper(buffer, languageHint);
+  const googleHint = languageHint || whisperDetected || '';
+
+  // Phase 2 — Google Speech (channel candidates + auto multi-pass when no hint).
+  if (googleEnabled && durationSeconds > 0) {
+    try {
+      results.push(await transcribeWithGoogleSpeech(
+        buffer,
+        mimeType,
+        fileName,
+        googleHint,
+        durationSeconds,
+        samples,
+        languageCandidates,
+      ));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Google Speech failed';
+      console.warn(`Google Speech failed: ${message}`);
+    }
+
+    // Phase 3 — Polish with explicit locale once we know the spoken language.
+    const refineLang = googleHint || results.find((entry) => entry.detected_language)?.detected_language || '';
+    if (refineLang && results.length > 0) {
+      const bestSoFar = pickBestTranscription(results, refineLang);
+      if (bestSoFar.text.length < 12 || !languageMatchesHint(bestSoFar.detected_language, refineLang)) {
+        try {
+          results.push(await transcribeWithGoogleSpeech(
+            buffer,
+            mimeType,
+            fileName,
+            refineLang,
+            durationSeconds,
+            samples,
+            languageCandidates,
+          ));
+        } catch {
+          // ignore polish failure
+        }
+      }
+    }
+  }
+
+  if (results.length === 0) {
+    throw new Error('Transcription failed for this recording.');
+  }
+
+  const preferredLang = googleHint || whisperDetected || languageCandidates[0] || '';
+  const best = results.length === 1 ? results[0] : pickBestTranscription(results, preferredLang);
+
+  const detected = await finalizeDetectedLanguage(best.text, best.detected_language || whisperDetected);
+  return {
+    ...best,
+    detected_language: detected || best.detected_language || whisperDetected || 'auto',
+    engine: best.engine.includes('+') ? best.engine : `${best.engine}+google-detect`,
+  };
 }

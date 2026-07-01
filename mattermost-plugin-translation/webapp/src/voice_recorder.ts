@@ -1,13 +1,3 @@
-type SpeechRecognitionCtor = new () => SpeechRecognition;
-
-function getSpeechRecognition(): SpeechRecognitionCtor | null {
-    const w = window as Window & {
-        SpeechRecognition?: SpeechRecognitionCtor;
-        webkitSpeechRecognition?: SpeechRecognitionCtor;
-    };
-    return w.SpeechRecognition || w.webkitSpeechRecognition || null;
-}
-
 function pickMimeType(): string {
     const candidates = [
         'audio/webm;codecs=opus',
@@ -46,9 +36,7 @@ export type RecorderState = 'inactive' | 'recording' | 'paused';
 export class VoiceRecorderSession {
     private mediaRecorder: MediaRecorder | null = null;
     private mediaStream: MediaStream | null = null;
-    private speechRecognition: SpeechRecognition | null = null;
     private chunks: Blob[] = [];
-    private transcriptParts: string[] = [];
     private startedAt = 0;
     private pausedMs = 0;
     private pauseStartedAt = 0;
@@ -64,41 +52,27 @@ export class VoiceRecorderSession {
             throw new Error('Microphone access is not supported in this browser.');
         }
 
-        this.mediaStream = await navigator.mediaDevices.getUserMedia({audio: true});
+        this.mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+                channelCount: 1,
+            },
+        });
         this.mimeType = pickMimeType();
         this.chunks = [];
-        this.transcriptParts = [];
         this.startedAt = Date.now();
         this.pausedMs = 0;
         this.pauseStartedAt = 0;
 
-        const SpeechRecognitionClass = getSpeechRecognition();
-        if (SpeechRecognitionClass) {
-            this.speechRecognition = new SpeechRecognitionClass();
-            this.speechRecognition.continuous = true;
-            this.speechRecognition.interimResults = true;
-            this.speechRecognition.lang = navigator.language || 'en-US';
-            this.speechRecognition.onresult = (event) => {
-                for (let i = event.resultIndex; i < event.results.length; i++) {
-                    const piece = event.results[i][0]?.transcript?.trim();
-                    if (piece && event.results[i].isFinal) {
-                        this.transcriptParts.push(piece);
-                    }
-                }
-            };
-            this.speechRecognition.onerror = () => {
-                // Browser speech recognition is best-effort only.
-            };
-            try {
-                this.speechRecognition.start();
-            } catch {
-                this.speechRecognition = null;
-            }
+        const recorderOptions: MediaRecorderOptions = {};
+        if (this.mimeType) {
+            recorderOptions.mimeType = this.mimeType;
+            recorderOptions.audioBitsPerSecond = 128000;
         }
 
-        this.mediaRecorder = this.mimeType
-            ? new MediaRecorder(this.mediaStream, {mimeType: this.mimeType})
-            : new MediaRecorder(this.mediaStream);
+        this.mediaRecorder = new MediaRecorder(this.mediaStream, recorderOptions);
 
         this.mediaRecorder.ondataavailable = (event) => {
             if (event.data.size > 0) {
@@ -118,13 +92,6 @@ export class VoiceRecorderSession {
         recorder.pause();
         this.pauseStartedAt = Date.now();
         this.state = 'paused';
-        if (this.speechRecognition) {
-            try {
-                this.speechRecognition.stop();
-            } catch {
-                // ignore
-            }
-        }
     }
 
     resume(): void {
@@ -138,27 +105,6 @@ export class VoiceRecorderSession {
         }
         recorder.resume();
         this.state = 'recording';
-
-        const SpeechRecognitionClass = getSpeechRecognition();
-        if (SpeechRecognitionClass && !this.speechRecognition) {
-            this.speechRecognition = new SpeechRecognitionClass();
-            this.speechRecognition.continuous = true;
-            this.speechRecognition.interimResults = true;
-            this.speechRecognition.lang = navigator.language || 'en-US';
-            this.speechRecognition.onresult = (event) => {
-                for (let i = event.resultIndex; i < event.results.length; i++) {
-                    const piece = event.results[i][0]?.transcript?.trim();
-                    if (piece && event.results[i].isFinal) {
-                        this.transcriptParts.push(piece);
-                    }
-                }
-            };
-            try {
-                this.speechRecognition.start();
-            } catch {
-                this.speechRecognition = null;
-            }
-        }
     }
 
     getElapsedMs(): number {
@@ -191,24 +137,6 @@ export class VoiceRecorderSession {
         }
         await stopPromise;
 
-        if (this.speechRecognition) {
-            await new Promise<void>((resolve) => {
-                const recognition = this.speechRecognition!;
-                const timeout = window.setTimeout(resolve, 500);
-                recognition.onend = () => {
-                    window.clearTimeout(timeout);
-                    resolve();
-                };
-                try {
-                    recognition.stop();
-                } catch {
-                    window.clearTimeout(timeout);
-                    resolve();
-                }
-            });
-            this.speechRecognition = null;
-        }
-
         await new Promise((resolve) => window.setTimeout(resolve, 200));
 
         this.mediaStream?.getTracks().forEach((track) => track.stop());
@@ -222,7 +150,6 @@ export class VoiceRecorderSession {
             throw new Error('No audio was captured. Try again and speak closer to the microphone.');
         }
 
-        const transcript = this.transcriptParts.join(' ').trim();
         const extension = extensionForMime(mimeType);
         const fileName = `voice-note-${Date.now()}.${extension}`;
 
@@ -230,7 +157,7 @@ export class VoiceRecorderSession {
             blob,
             fileName,
             mimeType,
-            transcript,
+            transcript: '',
             durationMs: this.getElapsedMs(),
         };
     }
@@ -239,19 +166,10 @@ export class VoiceRecorderSession {
         if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
             this.mediaRecorder.stop();
         }
-        if (this.speechRecognition) {
-            try {
-                this.speechRecognition.stop();
-            } catch {
-                // ignore
-            }
-        }
         this.mediaStream?.getTracks().forEach((track) => track.stop());
         this.mediaStream = null;
         this.mediaRecorder = null;
-        this.speechRecognition = null;
         this.chunks = [];
-        this.transcriptParts = [];
         this.state = 'inactive';
     }
 }

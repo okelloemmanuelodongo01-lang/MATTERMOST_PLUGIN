@@ -6,7 +6,7 @@ import {detectLanguageWithGoogle, isGoogleTranslateEnabled} from './google.js';
 import {detectLanguage as detectLanguageMyMemory} from './mymemory.js';
 import {getSpeechEngine, transcribeAudioBuffer} from './transcribe.js';
 import {isGoogleSpeechEnabled} from './google_speech.js';
-import {isGoogleTTSEnabled, synthesizeSpeech} from './google_tts.js';
+import {getCachedAudioEntryCount, getCachedGoogleVoiceCount, isGoogleTTSEnabled, listSupportedTTSLanguageBases, loadGoogleVoices, synthesizeSpeech} from './google_tts.js';
 import {getUsage, QuotaExceededError, trackUsage} from './usage.js';
 import {getSemanticModelName, isSemanticEmbeddingEnabled} from './semantic_embeddings.js';
 import {getTranslationEngine, listLanguages, translateText} from './translate.js';
@@ -43,6 +43,9 @@ app.get('/health', (_req, res) => {
     google_translate_configured: isGoogleTranslateEnabled(),
     google_speech_configured: isGoogleSpeechEnabled(),
     google_tts_configured: isGoogleTTSEnabled(),
+    google_tts_voices_cached: getCachedGoogleVoiceCount(),
+    google_tts_audio_cache_entries: getCachedAudioEntryCount(),
+    google_tts_language_bases_supported: listSupportedTTSLanguageBases().length,
     semantic_embeddings_enabled: isSemanticEmbeddingEnabled(),
     semantic_model: isSemanticEmbeddingEnabled() ? getSemanticModelName() : null,
   });
@@ -140,10 +143,15 @@ app.post('/transcribe', requireApiKey, upload.single('audio'), async (req, res) 
 
     const languageHint = String(req.body?.language_hint || req.body?.language || '').trim();
     const mimeType = String(req.body?.mime_type || file.mimetype || '').trim();
+    const rawCandidates = String(req.body?.language_candidates || '').trim();
+    const languageCandidates = rawCandidates
+      ? rawCandidates.split(/[,;]+/).map((code) => code.trim()).filter(Boolean)
+      : [];
 
     const result = await transcribeAudioBuffer(file.buffer, file.originalname || 'audio.webm', {
       languageHint: languageHint || undefined,
       mimeType: mimeType || undefined,
+      languageCandidates,
     });
     res.json(result);
   } catch (err) {
@@ -189,4 +197,12 @@ app.listen(PORT, () => {
   console.log(`  Translate:  POST http://localhost:${PORT}/translate`);
   console.log(`  Transcribe: POST http://localhost:${PORT}/transcribe`);
   console.log(`  Synthesize: POST http://localhost:${PORT}/synthesize`);
+
+  if (isGoogleTTSEnabled()) {
+    void loadGoogleVoices().then((voices) => {
+      console.log(`  TTS voices: ${voices.length} Google voices preloaded for read-aloud`);
+    }).catch((err) => {
+      console.warn('  TTS voices: preload skipped —', err instanceof Error ? err.message : err);
+    });
+  }
 });

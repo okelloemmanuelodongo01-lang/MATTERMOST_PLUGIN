@@ -180,7 +180,7 @@ func (p *Plugin) handleTranslate(w http.ResponseWriter, r *http.Request) {
 	text := strings.TrimSpace(req.Text)
 	mediaTranslateHint := ""
 	isMediaPost := false
-	var mediaSenderID string
+	var mediaPost *model.Post
 	if req.PostID != "" {
 		post, appErr := p.API.GetPost(req.PostID)
 		if appErr != nil {
@@ -189,7 +189,7 @@ func (p *Plugin) handleTranslate(w http.ResponseWriter, r *http.Request) {
 		}
 		if isMediaNotePost(post) {
 			isMediaPost = true
-			mediaSenderID = post.UserId
+			mediaPost = post
 			transcribed, err := p.transcribeMediaPostDetailed(post)
 			if err != nil {
 				p.API.LogWarn("Media STT failed", "post_id", req.PostID, "error", err.Error())
@@ -225,8 +225,8 @@ func (p *Plugin) handleTranslate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	from := strings.TrimSpace(req.From)
-	if isMediaPost {
-		from = p.mediaTranslationSourceLanguage(mediaTranslateHint, mediaSenderID, text)
+	if isMediaPost && mediaPost != nil {
+		from = p.mediaTranslationSourceLanguage(mediaTranslateHint, mediaPost, text)
 	}
 
 	if !isMediaPost {
@@ -280,21 +280,19 @@ func (p *Plugin) handleTranslate(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
-func (p *Plugin) mediaTranslationSourceLanguage(sttLang, senderUserID, transcript string) string {
+func (p *Plugin) mediaTranslationSourceLanguage(sttLang string, post *model.Post, transcript string) string {
 	source := normalizeLangCode(sttLang)
-	senderLang := ""
-	if senderUserID != "" {
-		senderLang = normalizeLangCode(p.getUserTargetLanguage(senderUserID))
+	if source != "" {
+		return source
 	}
 
-	if source == "" && senderLang != "" {
-		return senderLang
+	if post != nil {
+		if cached := normalizeLangCode(p.mediaLanguageHintFromPost(post)); cached != "" {
+			return cached
+		}
 	}
 
-	if senderLang != "" && source != senderLang && len(strings.TrimSpace(transcript)) < 24 {
-		return senderLang
-	}
-
+	_ = transcript
 	return source
 }
 
@@ -518,11 +516,13 @@ func (p *Plugin) handleGetLanguage(w http.ResponseWriter, r *http.Request) {
 	userID := r.Header.Get("Mattermost-User-ID")
 	lang := p.getUserTargetLanguage(userID)
 	voice := p.getUserTTSVoiceGender(userID)
+	readMode := p.getUserReadAloudMode(userID)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"target_language":  lang,
 		"tts_voice_gender": voice,
+		"read_aloud_mode":  readMode,
 	})
 }
 
@@ -532,6 +532,7 @@ func (p *Plugin) handleSetLanguage(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		TargetLanguage string `json:"target_language"`
 		TTSVoiceGender string `json:"tts_voice_gender"`
+		ReadAloudMode  string `json:"read_aloud_mode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
@@ -540,9 +541,10 @@ func (p *Plugin) handleSetLanguage(w http.ResponseWriter, r *http.Request) {
 
 	lang := strings.TrimSpace(body.TargetLanguage)
 	voice := strings.TrimSpace(body.TTSVoiceGender)
+	readMode := strings.TrimSpace(body.ReadAloudMode)
 
-	if lang == "" && voice == "" {
-		http.Error(w, "target_language or tts_voice_gender is required", http.StatusBadRequest)
+	if lang == "" && voice == "" && readMode == "" {
+		http.Error(w, "target_language, tts_voice_gender, or read_aloud_mode is required", http.StatusBadRequest)
 		return
 	}
 
@@ -560,9 +562,17 @@ func (p *Plugin) handleSetLanguage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if readMode != "" {
+		if err := p.setUserReadAloudMode(userID, readMode); err != nil {
+			http.Error(w, fmt.Sprintf("failed to save read-aloud mode: %s", err.Error()), http.StatusInternalServerError)
+			return
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"target_language":  p.getUserTargetLanguage(userID),
 		"tts_voice_gender": p.getUserTTSVoiceGender(userID),
+		"read_aloud_mode":  p.getUserReadAloudMode(userID),
 	})
 }

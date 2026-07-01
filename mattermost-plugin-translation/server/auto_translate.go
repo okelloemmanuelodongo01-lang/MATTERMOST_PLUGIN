@@ -30,7 +30,7 @@ func (p *Plugin) MessageHasBeenPosted(_ *plugin.Context, post *model.Post) {
 	}
 
 	if isVoiceNotePost(post) || isVideoNotePost(post) {
-		// Voice and video notes are translated on demand when the reader clicks "Translate to text".
+		go p.processMediaPost(post)
 		return
 	}
 
@@ -83,6 +83,9 @@ func (p *Plugin) autoTranslatePostTextWithHint(post *model.Post, text string, hi
 			defer wg.Done()
 
 			hint := strings.TrimSpace(hintLanguage)
+			if hint == "" && isMediaNotePost(post) {
+				hint = normalizeLangCode(p.mediaLanguageHintFromPost(post))
+			}
 			if hint == "" {
 				hint = p.getUserTargetLanguage(post.UserId)
 			}
@@ -182,4 +185,36 @@ func (p *Plugin) translateWithCache(text, from, to, hintLanguage string) (*Trans
 
 	p.storeCachedTranslation(cacheKey, result)
 	return result, false, nil
+}
+
+func (p *Plugin) processMediaPost(post *model.Post) {
+	if post == nil {
+		return
+	}
+
+	transcribed, err := p.transcribeMediaPostDetailed(post)
+	if err != nil {
+		p.API.LogWarn("Media transcription unavailable", "post_id", post.Id, "error", err.Error())
+		for _, userID := range p.getChannelMemberUserIDs(post.ChannelId) {
+			p.API.PublishWebSocketEvent("translation_error", map[string]interface{}{
+				"post_id": post.Id,
+				"error":   "Could not transcribe this recording. Check microphone quality and speaking-language setting.",
+				"auto":    true,
+			}, &model.WebsocketBroadcast{UserId: userID})
+		}
+		return
+	}
+
+	text := strings.TrimSpace(transcribed.Text)
+	if isPlaceholderMediaText(text, post) || text == "" {
+		p.API.LogDebug("Media note has no transcript to translate", "post_id", post.Id)
+		return
+	}
+
+	p.saveMediaTranscript(post, text)
+	if transcribed.DetectedLanguage != "" {
+		p.saveMediaDetectedLanguage(post, transcribed.DetectedLanguage)
+	}
+
+	p.autoTranslatePostTextWithHint(post, text, transcribed.DetectedLanguage)
 }

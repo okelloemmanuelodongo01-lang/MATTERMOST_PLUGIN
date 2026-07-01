@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,12 +19,63 @@ type speakAPIRequest struct {
 	PostID string `json:"post_id"`
 }
 
+type cachedSpeakAudio struct {
+	Audio     []byte `json:"audio"`
+	CachedAt  int64  `json:"cached_at"`
+	ExpiresAt int64  `json:"expires_at"`
+}
+
+func (p *Plugin) speakAudioCacheKey(text, language, voiceGender string) string {
+	hash := sha256.Sum256([]byte(strings.TrimSpace(text) + "|" + normalizeLangCode(language) + "|" + googleTTSGenderCode(voiceGender)))
+	return "speak_audio:" + hex.EncodeToString(hash[:16])
+}
+
+func (p *Plugin) getCachedSpeakAudio(key string) ([]byte, bool) {
+	data, err := p.API.KVGet(key)
+	if err != nil || len(data) == 0 {
+		return nil, false
+	}
+
+	var cached cachedSpeakAudio
+	if err := json.Unmarshal(data, &cached); err != nil {
+		return nil, false
+	}
+	if cached.ExpiresAt > 0 && time.Now().Unix() > cached.ExpiresAt {
+		_ = p.API.KVDelete(key)
+		return nil, false
+	}
+	if len(cached.Audio) == 0 {
+		return nil, false
+	}
+	return cached.Audio, true
+}
+
+func (p *Plugin) storeCachedSpeakAudio(key string, audio []byte) {
+	if len(audio) == 0 {
+		return
+	}
+	now := time.Now().Unix()
+	cached := cachedSpeakAudio{
+		Audio:     audio,
+		CachedAt:  now,
+		ExpiresAt: now + 7*24*3600,
+	}
+	data, err := json.Marshal(cached)
+	if err != nil {
+		return
+	}
+	if err := p.API.KVSet(key, data); err != nil {
+		p.API.LogWarn("Failed to cache speak audio", "error", err.Error())
+	}
+}
+
 func (p *Plugin) resolveSpeakableTextForUser(post *model.Post, userID string) (string, string, error) {
 	if post == nil {
 		return "", "", fmt.Errorf("post not found")
 	}
 
 	targetLang := p.getUserTargetLanguage(userID)
+	readMode := p.getUserReadAloudMode(userID)
 
 	if post.UserId == userID {
 		if isMediaNotePost(post) {
@@ -33,12 +86,9 @@ func (p *Plugin) resolveSpeakableTextForUser(post *model.Post, userID string) (s
 			return "", "", fmt.Errorf("no text to read")
 		}
 		if result, _, err := p.translateWithCache(text, "", targetLang, p.getUserTargetLanguage(post.UserId)); err == nil {
-			lang := normalizeLangCode(result.DetectedFrom)
-			if lang != "" {
-				return text, lang, nil
-			}
+			return text, speakLanguageForAuthor(result, targetLang), nil
 		}
-		return text, targetLang, nil
+		return text, normalizeLangCode(targetLang), nil
 	}
 
 	text := strings.TrimSpace(post.Message)
@@ -65,16 +115,44 @@ func (p *Plugin) resolveSpeakableTextForUser(post *model.Post, userID string) (s
 		return "", "", err
 	}
 
+	if readMode == "original" {
+		lang := normalizeLangCode(result.DetectedFrom)
+		if lang == "" {
+			lang = normalizeLangCode(targetLang)
+		}
+		return text, lang, nil
+	}
+
 	if isSameLanguage(result.DetectedFrom, targetLang) {
-		return text, targetLang, nil
+		lang := normalizeLangCode(result.DetectedFrom)
+		if lang == "" {
+			lang = normalizeLangCode(targetLang)
+		}
+		return text, lang, nil
 	}
 
 	spoken := strings.TrimSpace(result.Translated)
+	lang := normalizeLangCode(targetLang)
+	if lang == "" {
+		lang = normalizeLangCode(result.To)
+	}
 	if spoken == "" {
-		return text, targetLang, nil
+		if lang == "" {
+			lang = normalizeLangCode(result.DetectedFrom)
+		}
+		return text, lang, nil
 	}
 
-	return spoken, targetLang, nil
+	return spoken, lang, nil
+}
+
+func speakLanguageForAuthor(result *TranslationResult, targetLang string) string {
+	if result != nil {
+		if lang := normalizeLangCode(result.DetectedFrom); lang != "" {
+			return lang
+		}
+	}
+	return normalizeLangCode(targetLang)
 }
 
 func (p *Plugin) callSynthesizeAPI(ctx context.Context, text, language, voiceGender string) ([]byte, error) {
@@ -176,9 +254,10 @@ func (p *Plugin) handleSpeakResolve(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{
-		"text":           text,
-		"language":       language,
-		"voice_gender":   p.getUserTTSVoiceGender(userID),
+		"text":             text,
+		"language":         language,
+		"voice_gender":     p.getUserTTSVoiceGender(userID),
+		"read_aloud_mode":  p.getUserReadAloudMode(userID),
 	})
 }
 
@@ -209,17 +288,32 @@ func (p *Plugin) handleSpeak(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	voiceGender := p.getUserTTSVoiceGender(userID)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	audio, err := p.callSynthesizeAPI(ctx, text, language, p.getUserTTSVoiceGender(userID))
+	cacheKey := p.speakAudioCacheKey(text, language, voiceGender)
+	if audio, ok := p.getCachedSpeakAudio(cacheKey); ok {
+		w.Header().Set("Content-Type", "audio/mpeg")
+		w.Header().Set("Cache-Control", "private, max-age=3600")
+		w.Header().Set("X-TTS-Language", language)
+		w.Header().Set("X-TTS-Cached", "true")
+		_, _ = w.Write(audio)
+		return
+	}
+
+	audio, err := p.callSynthesizeAPI(ctx, text, language, voiceGender)
 	if err != nil {
 		p.API.LogWarn("Speech synthesis failed", "post_id", postID, "error", err.Error())
 		http.Error(w, friendlySynthesisError(err.Error()), http.StatusBadGateway)
 		return
 	}
 
+	p.storeCachedSpeakAudio(cacheKey, audio)
+
 	w.Header().Set("Content-Type", "audio/mpeg")
 	w.Header().Set("Cache-Control", "private, max-age=3600")
+	w.Header().Set("X-TTS-Language", language)
+	w.Header().Set("X-TTS-Cached", "false")
 	_, _ = w.Write(audio)
 }

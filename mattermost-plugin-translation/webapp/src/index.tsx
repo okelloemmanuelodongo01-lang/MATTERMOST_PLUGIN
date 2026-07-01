@@ -12,6 +12,7 @@ import reducer, {
     SET_PLUGIN_CONFIG,
     SET_TARGET_LANGUAGE,
     SET_TTS_VOICE_GENDER,
+    SET_READ_ALOUD_MODE,
     SET_USER_PUBLIC_LANGUAGE,
     SYNC_TRANSLATIONS_SUCCESS,
     TRANSLATION_ERROR,
@@ -149,12 +150,19 @@ function registerStyles() {
         }
         .translation-member-panel {
             padding: 12px 16px;
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            max-height: 100%;
+            box-sizing: border-box;
+            overflow: hidden;
         }
         .translation-member-panel__you {
             margin-bottom: 16px;
             display: flex;
             flex-direction: column;
             gap: 8px;
+            flex-shrink: 0;
         }
         .translation-member-panel__label {
             display: block;
@@ -187,6 +195,13 @@ function registerStyles() {
         .translation-member-panel__title {
             font-weight: 600;
             margin-bottom: 10px;
+        }
+        .translation-member-panel__members {
+            flex: 1 1 auto;
+            min-height: 0;
+            overflow-y: auto;
+            overflow-x: hidden;
+            padding-right: 2px;
         }
         .translation-member-panel__row {
             display: flex;
@@ -583,6 +598,47 @@ function registerStyles() {
             display: inline-flex;
             align-items: center;
             gap: 2px;
+            position: relative;
+        }
+        .translation-media-note-buttons__lang-wrap {
+            position: relative;
+        }
+        .translation-media-note-buttons__lang-toggle {
+            min-width: 28px;
+            height: 28px;
+            padding: 0 6px;
+            border: 1px solid rgba(var(--center-channel-color-rgb, 63, 67, 80), 0.2);
+            border-radius: 4px;
+            background: rgba(var(--center-channel-color-rgb, 63, 67, 80), 0.06);
+            font-size: 11px;
+            font-weight: 700;
+            cursor: pointer;
+            color: var(--center-channel-color, #3f4350);
+        }
+        .translation-media-note-buttons__lang-panel {
+            position: absolute;
+            bottom: calc(100% + 8px);
+            left: 0;
+            z-index: 20;
+            width: 240px;
+            padding: 10px;
+            border-radius: 8px;
+            border: 1px solid rgba(var(--center-channel-color-rgb, 63, 67, 80), 0.16);
+            background: var(--center-channel-bg, #fff);
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+        }
+        .translation-media-note-buttons__lang-label {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            opacity: 0.7;
+            margin-bottom: 6px;
+        }
+        .translation-media-note-buttons__lang-hint {
+            margin-top: 8px;
+            font-size: 11px;
+            line-height: 1.35;
+            color: rgba(var(--center-channel-color-rgb, 63, 67, 80), 0.65);
         }
         .translation-voice-note__timer--warn,
         .translation-video-note__timer--warn {
@@ -998,7 +1054,7 @@ async function loadUserLanguage() {
     }
 
     try {
-        const data = await fetchJSON<{target_language: string; tts_voice_gender?: string}>(`${API_BASE}/language`);
+        const data = await fetchJSON<{target_language: string; tts_voice_gender?: string; read_aloud_mode?: string}>(`${API_BASE}/language`);
         const userId = storeRef.getState().entities.users.currentUserId;
         storeRef.dispatch({
             type: SET_TARGET_LANGUAGE,
@@ -1008,6 +1064,10 @@ async function loadUserLanguage() {
         const gender = (data.tts_voice_gender || 'neutral').toLowerCase();
         if (gender === 'male' || gender === 'female' || gender === 'neutral') {
             storeRef.dispatch({type: SET_TTS_VOICE_GENDER, gender});
+        }
+        const readMode = (data.read_aloud_mode || 'receive').toLowerCase();
+        if (readMode === 'receive' || readMode === 'original') {
+            storeRef.dispatch({type: SET_READ_ALOUD_MODE, mode: readMode});
         }
     } catch {
         // keep default

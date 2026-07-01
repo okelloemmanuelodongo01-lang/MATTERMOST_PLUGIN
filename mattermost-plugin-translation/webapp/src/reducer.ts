@@ -25,23 +25,27 @@ export type TranslationState = {
     userLanguages: Record<string, string>;
     targetLanguage: string;
     ttsVoiceGender: VoiceGender;
+    readAloudMode: ReadAloudMode;
     enableAutoTranslate: boolean;
     enablePreTranslatePreview: boolean;
 };
 
 export type VoiceGender = 'male' | 'female' | 'neutral';
+export type ReadAloudMode = 'receive' | 'original';
 
 export const initialState: TranslationState = {
     byPostId: {},
     userLanguages: {},
     targetLanguage: 'en',
     ttsVoiceGender: 'neutral',
+    readAloudMode: 'receive',
     enableAutoTranslate: true,
     enablePreTranslatePreview: true,
 };
 
 export const SET_TARGET_LANGUAGE = 'SET_TARGET_LANGUAGE';
 export const SET_TTS_VOICE_GENDER = 'SET_TTS_VOICE_GENDER';
+export const SET_READ_ALOUD_MODE = 'SET_READ_ALOUD_MODE';
 export const SET_PLUGIN_CONFIG = 'SET_PLUGIN_CONFIG';
 export const MERGE_USER_LANGUAGES = 'MERGE_USER_LANGUAGES';
 export const SET_USER_PUBLIC_LANGUAGE = 'SET_USER_PUBLIC_LANGUAGE';
@@ -53,6 +57,7 @@ export const SYNC_TRANSLATIONS_SUCCESS = 'SYNC_TRANSLATIONS_SUCCESS';
 type PluginAction =
     | {type: typeof SET_TARGET_LANGUAGE; language: string; userId?: string}
     | {type: typeof SET_TTS_VOICE_GENDER; gender: VoiceGender}
+    | {type: typeof SET_READ_ALOUD_MODE; mode: ReadAloudMode}
     | {type: typeof SET_PLUGIN_CONFIG; enableAutoTranslate: boolean; enablePreTranslatePreview: boolean}
     | {type: typeof MERGE_USER_LANGUAGES; languages: Record<string, string>}
     | {type: typeof SET_USER_PUBLIC_LANGUAGE; userId: string; language: string}
@@ -72,6 +77,8 @@ export default function reducer(state = initialState, action: PluginAction): Tra
     }
     case SET_TTS_VOICE_GENDER:
         return {...state, ttsVoiceGender: action.gender};
+    case SET_READ_ALOUD_MODE:
+        return {...state, readAloudMode: action.mode};
     case MERGE_USER_LANGUAGES:
         return {
             ...state,

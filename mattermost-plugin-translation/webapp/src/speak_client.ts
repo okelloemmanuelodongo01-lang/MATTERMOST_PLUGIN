@@ -1,3 +1,5 @@
+import {languageCodeLabel} from './language_labels';
+
 const PLUGIN_ID = 'com.transchecker.translation';
 const API_BASE = `/plugins/${PLUGIN_ID}/api/v1`;
 
@@ -5,6 +7,9 @@ let activeAudio: HTMLAudioElement | null = null;
 let activeObjectUrl: string | null = null;
 let activePostId: string | null = null;
 let usingBrowserSpeech = false;
+
+const postAudioCache = new Map<string, Blob>();
+const POST_AUDIO_CACHE_MAX = 50;
 
 type SpeechListener = (postId: string | null) => void;
 const listeners = new Set<SpeechListener>();
@@ -34,6 +39,24 @@ export function isSpeechPlaying(): boolean {
         return true;
     }
     return false;
+}
+
+export function clearSpeakAudioCache(): void {
+    postAudioCache.clear();
+}
+
+function cachePostAudio(postId: string, blob: Blob): void {
+    if (postAudioCache.has(postId)) {
+        postAudioCache.delete(postId);
+    }
+    postAudioCache.set(postId, blob);
+    while (postAudioCache.size > POST_AUDIO_CACHE_MAX) {
+        const oldest = postAudioCache.keys().next().value;
+        if (!oldest) {
+            break;
+        }
+        postAudioCache.delete(oldest);
+    }
 }
 
 export function stopActiveSpeech(): void {
@@ -70,11 +93,47 @@ function toBcp47(language: string): string {
         fr: 'fr-FR',
         ja: 'ja-JP',
         lg: 'lg-UG',
+        ln: 'ln-CD',
         sw: 'sw-KE',
         de: 'de-DE',
         es: 'es-ES',
+        ar: 'ar-SA',
+        hi: 'hi-IN',
+        pt: 'pt-BR',
+        zh: 'zh-CN',
+        ko: 'ko-KR',
+        it: 'it-IT',
+        nl: 'nl-NL',
+        pl: 'pl-PL',
+        ru: 'ru-RU',
+        tr: 'tr-TR',
+        vi: 'vi-VN',
+        id: 'id-ID',
+        am: 'am-ET',
+        ha: 'ha-NG',
+        yo: 'yo-NG',
+        zu: 'zu-ZA',
     };
     return defaults[code] || `${code}-${code.toUpperCase()}`;
+}
+
+function parseSpeakError(raw: string): string {
+    const trimmed = raw.trim();
+    if (!trimmed) {
+        return 'Read-aloud is unavailable right now.';
+    }
+    try {
+        const parsed = JSON.parse(trimmed) as {error?: string};
+        if (parsed.error) {
+            return parsed.error;
+        }
+    } catch {
+        // plain text from plugin http.Error
+    }
+    if (trimmed.length > 200) {
+        return trimmed.slice(0, 200) + '…';
+    }
+    return trimmed;
 }
 
 function pickBrowserVoice(language: string, voiceGender?: string): SpeechSynthesisVoice | null {
@@ -89,7 +148,11 @@ function pickBrowserVoice(language: string, voiceGender?: string): SpeechSynthes
 
     const langPrefix = toBcp47(language).toLowerCase().split('-')[0];
     const languageMatches = voices.filter((voice) => voice.lang.toLowerCase().startsWith(langPrefix));
-    const pool = languageMatches.length > 0 ? languageMatches : voices;
+    if (languageMatches.length === 0) {
+        return null;
+    }
+
+    const pool = languageMatches;
 
     const gender = (voiceGender || 'neutral').toLowerCase();
     const femalePattern = /female|woman|girl|zira|samantha|victoria|hazel|susan|karen|moira|tessa|amelie|marie|claire/i;
@@ -105,7 +168,35 @@ function pickBrowserVoice(language: string, voiceGender?: string): SpeechSynthes
     return pool[0] || null;
 }
 
-async function fetchSpeakResolve(postId: string): Promise<{text: string; language: string; voice_gender?: string}> {
+function ensureBrowserVoicesReady(): Promise<void> {
+    if (typeof window === 'undefined' || !window.speechSynthesis) {
+        return Promise.resolve();
+    }
+    if (window.speechSynthesis.getVoices().length > 0) {
+        return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+        const done = () => {
+            window.speechSynthesis.removeEventListener('voiceschanged', done);
+            resolve();
+        };
+        window.speechSynthesis.addEventListener('voiceschanged', done);
+        window.setTimeout(done, 400);
+    });
+}
+
+if (typeof window !== 'undefined' && window.speechSynthesis) {
+    void ensureBrowserVoicesReady();
+}
+
+type SpeakResolve = {
+    text: string;
+    language: string;
+    voice_gender?: string;
+    read_aloud_mode?: string;
+};
+
+async function fetchSpeakResolve(postId: string): Promise<SpeakResolve> {
     const response = await fetch(`${API_BASE}/speak/resolve`, {
         method: 'POST',
         credentials: 'same-origin',
@@ -121,13 +212,24 @@ async function fetchSpeakResolve(postId: string): Promise<{text: string; languag
         throw new Error(text || `Could not prepare speech (${response.status})`);
     }
 
-    return response.json() as Promise<{text: string; language: string}>;
+    return response.json() as Promise<SpeakResolve>;
+}
+
+export async function fetchSpeakPreview(postId: string): Promise<{language: string; languageLabel: string}> {
+    const resolved = await fetchSpeakResolve(postId);
+    const language = resolved.language || 'en';
+    return {
+        language,
+        languageLabel: languageCodeLabel(language),
+    };
 }
 
 async function playWithBrowserSpeech(postId: string, text: string, language: string, voiceGender?: string): Promise<'started'> {
     if (typeof window === 'undefined' || !window.speechSynthesis) {
         throw new Error('This browser does not support read-aloud.');
     }
+
+    await ensureBrowserVoicesReady();
 
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = toBcp47(language);
@@ -151,6 +253,7 @@ async function playWithBrowserSpeech(postId: string, text: string, language: str
 }
 
 async function playWithGoogleAudio(postId: string, blob: Blob): Promise<'started'> {
+    cachePostAudio(postId, blob);
     activeObjectUrl = URL.createObjectURL(blob);
     activePostId = postId;
     activeAudio = new Audio(activeObjectUrl);
@@ -174,6 +277,11 @@ export async function playPostSpeech(postId: string): Promise<'started' | 'stopp
 
     stopActiveSpeech();
 
+    const cached = postAudioCache.get(postId);
+    if (cached && cached.size > 0) {
+        return playWithGoogleAudio(postId, cached);
+    }
+
     const response = await fetch(`${API_BASE}/speak`, {
         method: 'POST',
         credentials: 'same-origin',
@@ -191,11 +299,17 @@ export async function playPostSpeech(postId: string): Promise<'started' | 'stopp
         }
     }
 
+    const errorText = await response.text();
     const resolved = await fetchSpeakResolve(postId);
     const text = resolved.text?.trim();
     if (!text) {
         throw new Error('No text available to read aloud.');
     }
 
-    return playWithBrowserSpeech(postId, text, resolved.language || 'en', resolved.voice_gender);
+    const language = resolved.language || 'en';
+    try {
+        return await playWithBrowserSpeech(postId, text, language, resolved.voice_gender);
+    } catch {
+        throw new Error(parseSpeakError(errorText));
+    }
 }
