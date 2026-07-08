@@ -7,7 +7,7 @@
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "build": "tsc",
-    "test": "tsx src/chat_slang.test.ts"
+    "test": "tsx src/chat_slang.test.ts && tsx src/markdown_translate.test.ts && tsx src/command_phrases.test.ts && tsx src/transcript_quality.test.ts && tsx src/speech_language_catalog.test.ts && tsx src/spoken_language_hints.test.ts"
   },
   "dependencies": {
     "@xenova/transformers": "^2.17.2",

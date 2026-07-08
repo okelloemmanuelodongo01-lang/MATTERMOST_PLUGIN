@@ -2,6 +2,7 @@ import type {FileInfo} from '@mattermost/types/files';
 import type {Post} from '@mattermost/types/posts';
 
 import {getVideoTranscript, isVideoNotePost} from './video_post_utils';
+
 export function isVoiceFileInfo(file: FileInfo): boolean {
     if (file.name?.startsWith('voice-note-')) {
         return true;
@@ -37,6 +38,10 @@ export function isVoiceNotePost(post: Post | null | undefined): boolean {
     }
 
     return false;
+}
+
+export function isMediaNotePost(post: Post | null | undefined): boolean {
+    return isVoiceNotePost(post) || isVideoNotePost(post);
 }
 
 export function getVoiceDurationMs(post: Post): number | undefined {
@@ -97,7 +102,7 @@ export function shouldIncludePostInTranslationSync(post: Post): boolean {
     if (!post.id) {
         return false;
     }
-    if (isVoiceNotePost(post) || isVideoNotePost(post)) {
+    if (isMediaNotePost(post)) {
         return false;
     }
     return Boolean(getPostTranslationSourceText(post));

@@ -4,6 +4,7 @@ import type {Post} from '@mattermost/types/posts';
 
 import VideoNotePlayer from './video_note_player';
 import MediaTranscriptPanel from './media_transcript_panel';
+import MediaAuthorPanel from './media_author_panel';
 import PostSpeakBar from './post_speak_bar';
 import {durationSecondsFromMs} from '../voice_player_utils';
 import {getVideoDurationMs, getVideoFileId} from '../video_post_utils';
@@ -27,6 +28,7 @@ export default function VideoNotePost({post}: Props) {
                 />
             )}
             <MediaTranscriptPanel post={post} />
+            <MediaAuthorPanel post={post} />
             <PostSpeakBar post={post} />
         </div>
     );

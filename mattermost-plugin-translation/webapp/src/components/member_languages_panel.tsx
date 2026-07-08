@@ -13,6 +13,7 @@ import {getCurrentUserId} from 'mattermost-redux/selectors/entities/users';
 import LanguageSelect from './language_select';
 
 import VoiceGenderSelect, {type VoiceGender} from './voice_gender_select';
+import ReadAloudModeSelect from './read_aloud_mode_select';
 import type {ReadAloudMode} from '../reducer';
 
 import {
@@ -31,7 +32,8 @@ import {
 
 } from '../reducer';
 
-import {languageShortCode, languageCodeLabel} from '../language_labels';
+import {languageShortCode} from '../language_labels';
+import {getLanguageLabel} from '../language_options';
 import {clearSpeakAudioCache} from '../speak_client';
 
 
@@ -70,6 +72,8 @@ type Props = {
 
     onReadAloudModeSaved: (mode: ReadAloudMode) => void;
 
+    onResyncChannel?: (channelId: string) => void;
+
 };
 
 
@@ -87,6 +91,10 @@ type State = {
     savingVoice: boolean;
 
     savingReadAloudMode: boolean;
+
+    voiceGender: VoiceGender;
+
+    readAloudMode: ReadAloudMode;
 
 };
 
@@ -126,106 +134,204 @@ function normalizeReadAloudMode(value?: string): ReadAloudMode {
 
 class MemberLanguagesPanel extends React.PureComponent<Props, State> {
 
-    state: State = {
-
-        members: [],
-
-        loading: true,
-
-        error: '',
-
-        savingLanguage: false,
-
-        savingVoice: false,
-
-        savingReadAloudMode: false,
-
-    };
+    constructor(props: Props) {
+        super(props);
+        this.state = {
+            members: [],
+            loading: true,
+            error: '',
+            savingLanguage: false,
+            savingVoice: false,
+            savingReadAloudMode: false,
+            voiceGender: props.myVoiceGender,
+            readAloudMode: props.myReadAloudMode,
+        };
+    }
 
 
 
     componentDidMount() {
-
         void this.loadMembers();
-
+        window.setTimeout(() => void this.loadMembers(), 1200);
     }
 
 
 
     componentDidUpdate(prevProps: Props) {
-
-        if (
-
-            prevProps.channelId !== this.props.channelId ||
-
-            prevProps.myReceiveLanguage !== this.props.myReceiveLanguage ||
-
-            prevProps.userLanguages !== this.props.userLanguages
-
-        ) {
-
+        if (prevProps.channelId !== this.props.channelId) {
             void this.loadMembers();
-
         }
 
+        if (prevProps.myVoiceGender !== this.props.myVoiceGender && !this.state.savingVoice) {
+            this.setState({voiceGender: this.props.myVoiceGender});
+        }
+
+        if (prevProps.myReadAloudMode !== this.props.myReadAloudMode && !this.state.savingReadAloudMode) {
+            this.setState({readAloudMode: this.props.myReadAloudMode});
+        }
     }
 
 
 
     loadMembers = async () => {
-
-        const {channelId} = this.props;
+        const {channelId, userLanguages} = this.props;
 
         if (!channelId) {
-
             this.setState({loading: false, members: [], error: 'Open a channel to see member languages.'});
-
             return;
-
         }
-
-
 
         this.setState({loading: true, error: ''});
 
         try {
+            const members = await this.loadMembersForChannel(channelId, userLanguages);
+            this.setState({members, loading: false});
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to load';
+            this.setState({loading: false, error: message});
+        }
+    };
 
-            const response = await fetch(
+    loadMembersForChannel = async (
+        channelId: string,
+        userLanguages: Record<string, string>,
+    ): Promise<MemberLanguage[]> => {
+        const languageMap: Record<string, string> = {...userLanguages};
 
+        try {
+            const pluginResponse = await fetch(
                 `${API_BASE}/channel-languages?channel_id=${encodeURIComponent(channelId)}`,
-
                 {
-
                     credentials: 'same-origin',
-
                     headers: {'X-Requested-With': 'XMLHttpRequest'},
-
                 },
-
             );
 
+            if (pluginResponse.ok) {
+                const pluginData = await pluginResponse.json() as {members?: MemberLanguage[]};
+                for (const member of pluginData.members || []) {
+                    if (member.user_id && member.target_language) {
+                        languageMap[member.user_id] = member.target_language;
+                    }
+                }
 
-
-            if (!response.ok) {
-
-                throw new Error('Could not load member languages');
-
+                if ((pluginData.members || []).length > 0) {
+                    return (pluginData.members || []).map((member) => ({
+                        ...member,
+                        target_language: languageMap[member.user_id] || member.target_language || 'en',
+                    }));
+                }
             }
-
-
-
-            const data = await response.json() as {members: MemberLanguage[]};
-
-            this.setState({members: data.members || [], loading: false});
-
-        } catch (error) {
-
-            const message = error instanceof Error ? error.message : 'Failed to load';
-
-            this.setState({loading: false, error: message});
-
+        } catch {
+            // Fall back to Mattermost channel members below.
         }
 
+        const mmMembers = await this.fetchMattermostChannelMembers(channelId);
+        if (mmMembers.length === 0) {
+            return [];
+        }
+
+        const profiles = await this.fetchMattermostUserProfiles(mmMembers.map((member) => member.user_id));
+        const missingLanguageIds = profiles
+            .map((profile) => profile.id)
+            .filter((userId) => !languageMap[userId]);
+
+        if (missingLanguageIds.length > 0) {
+            const fetchedLanguages = await this.fetchUserLanguages(missingLanguageIds);
+            Object.assign(languageMap, fetchedLanguages);
+        }
+
+        return profiles.map((profile) => ({
+            user_id: profile.id,
+            username: profile.username,
+            display_name: profile.display_name,
+            target_language: languageMap[profile.id] || 'en',
+        })).sort((left, right) => (left.display_name || left.username).localeCompare(right.display_name || right.username));
+    };
+
+    fetchMattermostChannelMembers = async (channelId: string): Promise<Array<{user_id: string}>> => {
+        const response = await fetch(
+            `/api/v4/channels/${encodeURIComponent(channelId)}/members?per_page=200`,
+            {
+                credentials: 'same-origin',
+                headers: {'X-Requested-With': 'XMLHttpRequest'},
+            },
+        );
+
+        if (!response.ok) {
+            throw new Error('Could not load channel members');
+        }
+
+        const members = await response.json() as Array<{user_id?: string}>;
+        return members
+            .map((member) => ({user_id: String(member.user_id || '')}))
+            .filter((member) => Boolean(member.user_id));
+    };
+
+    fetchMattermostUserProfiles = async (userIds: string[]): Promise<Array<{
+        id: string;
+        username: string;
+        display_name: string;
+    }>> => {
+        const uniqueIds = [...new Set(userIds.filter(Boolean))];
+        if (uniqueIds.length === 0) {
+            return [];
+        }
+
+        const response = await fetch('/api/v4/users/ids', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+            },
+            body: JSON.stringify(uniqueIds),
+        });
+
+        if (!response.ok) {
+            throw new Error('Could not load member profiles');
+        }
+
+        const profiles = await response.json() as Array<{
+            id: string;
+            username: string;
+            nickname?: string;
+            first_name?: string;
+            last_name?: string;
+        }>;
+
+        return profiles.map((profile) => ({
+            id: profile.id,
+            username: profile.username,
+            display_name: (profile.nickname || `${profile.first_name || ''} ${profile.last_name || ''}`.trim() || profile.username).trim(),
+        }));
+    };
+
+    fetchUserLanguages = async (userIds: string[]): Promise<Record<string, string>> => {
+        const languages: Record<string, string> = {};
+
+        await Promise.all(userIds.map(async (userId) => {
+            try {
+                const response = await fetch(
+                    `${API_BASE}/user-language?user_id=${encodeURIComponent(userId)}`,
+                    {
+                        credentials: 'same-origin',
+                        headers: {'X-Requested-With': 'XMLHttpRequest'},
+                    },
+                );
+                if (!response.ok) {
+                    return;
+                }
+                const data = await response.json() as {target_language?: string};
+                if (data.target_language) {
+                    languages[userId] = data.target_language;
+                }
+            } catch {
+                // Ignore per-user language lookup failures.
+            }
+        }));
+
+        return languages;
     };
 
 
@@ -267,108 +373,72 @@ class MemberLanguagesPanel extends React.PureComponent<Props, State> {
 
 
     handleLanguageChange = async (language: string) => {
-
-        const {currentUserId, onLanguageSaved} = this.props;
-
+        const {currentUserId, onLanguageSaved, onResyncChannel, channelId} = this.props;
         this.setState({savingLanguage: true, error: ''});
 
-        try {
-
-            await this.savePreferences({target_language: language});
-
-            clearSpeakAudioCache();
-
-
-
-            if (currentUserId) {
-
-                onLanguageSaved(language, currentUserId);
-
-            }
-
-        } catch (error) {
-
-            const message = error instanceof Error ? error.message : 'Failed to save language';
-
-            this.setState({error: message});
-
-        } finally {
-
-            this.setState({savingLanguage: false});
-
+        if (currentUserId) {
+            onLanguageSaved(language, currentUserId);
         }
 
+        try {
+            await this.savePreferences({target_language: language});
+            clearSpeakAudioCache();
+            void this.loadMembers();
+            if (channelId) {
+                onResyncChannel?.(channelId);
+            }
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to save language';
+            this.setState({error: message});
+        } finally {
+            this.setState({savingLanguage: false});
+        }
     };
-
-
 
     handleVoiceGenderChange = async (gender: VoiceGender) => {
-
         const {onVoiceGenderSaved} = this.props;
-
-        this.setState({savingVoice: true, error: ''});
+        this.setState({savingVoice: true, error: '', voiceGender: gender});
+        onVoiceGenderSaved(gender);
 
         try {
-
             const data = await this.savePreferences({tts_voice_gender: gender});
-
             clearSpeakAudioCache();
-
             onVoiceGenderSaved(normalizeVoiceGender(data.tts_voice_gender || gender));
-
+            this.setState({voiceGender: normalizeVoiceGender(data.tts_voice_gender || gender)});
         } catch (error) {
-
             const message = error instanceof Error ? error.message : 'Failed to save voice preference';
-
-            this.setState({error: message});
-
+            this.setState({error: message, voiceGender: this.props.myVoiceGender});
         } finally {
-
             this.setState({savingVoice: false});
-
         }
-
     };
 
-
-
     handleReadAloudModeChange = async (mode: ReadAloudMode) => {
-
         const {onReadAloudModeSaved} = this.props;
-
-        this.setState({savingReadAloudMode: true, error: ''});
+        this.setState({savingReadAloudMode: true, error: '', readAloudMode: mode});
+        onReadAloudModeSaved(mode);
 
         try {
-
             const data = await this.savePreferences({read_aloud_mode: mode});
-
             clearSpeakAudioCache();
-
-            onReadAloudModeSaved(normalizeReadAloudMode(data.read_aloud_mode || mode));
-
+            const saved = normalizeReadAloudMode(data.read_aloud_mode || mode);
+            onReadAloudModeSaved(saved);
+            this.setState({readAloudMode: saved});
         } catch (error) {
-
             const message = error instanceof Error ? error.message : 'Failed to save read-aloud mode';
-
-            this.setState({error: message});
-
+            this.setState({error: message, readAloudMode: this.props.myReadAloudMode});
         } finally {
-
             this.setState({savingReadAloudMode: false});
-
         }
-
     };
 
 
 
     render() {
 
-        const {myReceiveLanguage, myVoiceGender, myReadAloudMode, userLanguages} = this.props;
+        const {myReceiveLanguage, userLanguages, currentUserId} = this.props;
 
-        const {members, loading, error, savingLanguage, savingVoice, savingReadAloudMode} = this.state;
-
-
+        const {members, loading, error, savingLanguage, savingVoice, savingReadAloudMode, voiceGender, readAloudMode} = this.state;
 
         const displayMembers = members.map((member) => ({
 
@@ -378,107 +448,128 @@ class MemberLanguagesPanel extends React.PureComponent<Props, State> {
 
         }));
 
+        const receiveLabel = getLanguageLabel(myReceiveLanguage);
+        const speakHint = readAloudMode === 'receive'
+            ? `Speaker uses Google voices when available. Reading in ${receiveLabel} when set to translated mode.`
+            : 'Speaker uses Google voices when available. Reading the original message text.';
 
+        const memberInitial = (name: string) => (name.trim().charAt(0) || '?').toUpperCase();
 
         return (
 
             <div className='translation-member-panel'>
 
-                <div className='translation-member-panel__you'>
+                <section className='translation-member-panel__settings'>
 
-                    <div className='translation-member-panel__label'>Your receive language</div>
+                    <div className='translation-member-panel__field'>
 
-                    <LanguageSelect
+                        <label className='translation-member-panel__label'>Your receive language</label>
 
-                        className='translation-language-select'
+                        <LanguageSelect
 
-                        value={myReceiveLanguage}
+                            className='translation-language-select'
 
-                        disabled={savingLanguage}
+                            value={myReceiveLanguage}
 
-                        onChange={(language) => void this.handleLanguageChange(language)}
+                            disabled={savingLanguage}
 
-                    />
+                            onChange={(language) => void this.handleLanguageChange(language)}
 
-                    <div className='translation-member-panel__label'>Read-aloud voice</div>
-
-                    <VoiceGenderSelect
-
-                        className='translation-language-select'
-
-                        value={myVoiceGender}
-
-                        disabled={savingVoice}
-
-                        onChange={(gender) => void this.handleVoiceGenderChange(gender)}
-
-                    />
-
-                    <div className='translation-member-panel__label'>Read-aloud text</div>
-
-                    <select
-
-                        className='translation-language-select'
-
-                        value={myReadAloudMode}
-
-                        disabled={savingReadAloudMode}
-
-                        onChange={(event) => void this.handleReadAloudModeChange(event.target.value as ReadAloudMode)}
-
-                    >
-
-                        <option value='receive'>My language (translated)</option>
-
-                        <option value='original'>Original message language</option>
-
-                    </select>
-
-                    <div className='translation-member-panel__hint-block translation-member-panel__hint-block--tight'>
-
-                        Speaker icon uses native Google voices. Reading in: {languageCodeLabel(myReceiveLanguage)} when set to translated mode.
+                        />
 
                     </div>
 
-                </div>
+                    <div className='translation-member-panel__field'>
 
-                <div className='translation-member-panel__members'>
+                        <label className='translation-member-panel__label'>Read-aloud voice</label>
 
-                <div className='translation-member-panel__title'>Channel members</div>
+                        <VoiceGenderSelect
 
-                <div className='translation-member-panel__hint-block'>
+                            value={voiceGender}
 
-                    Each badge is that person&apos;s receive language (visible to everyone).
+                            disabled={savingVoice}
 
-                </div>
+                            onChange={(gender) => void this.handleVoiceGenderChange(gender)}
 
-                {loading && <div className='translation-member-panel__hint'>Loading…</div>}
-
-                {error && <div className='translation-member-panel__error'>{error}</div>}
-
-                {!loading && !error && displayMembers.map((member) => (
-
-                    <div
-
-                        key={member.user_id}
-
-                        className='translation-member-panel__row'
-
-                    >
-
-                        <span className='translation-member-panel__name'>{member.display_name || member.username}</span>
-
-                        <span className='translation-member-panel__badge'>
-
-                            {languageShortCode(member.target_language)}
-
-                        </span>
+                        />
 
                     </div>
 
-                ))}
+                    <div className='translation-member-panel__field'>
 
-                </div>
+                        <label className='translation-member-panel__label'>Read-aloud text</label>
+
+                        <ReadAloudModeSelect
+                            value={readAloudMode}
+                            disabled={savingReadAloudMode}
+                            onChange={(mode) => void this.handleReadAloudModeChange(mode)}
+                        />
+
+                    </div>
+
+                    <p className='translation-member-panel__speak-hint'>{speakHint}</p>
+
+                </section>
+
+                <section className='translation-member-panel__members'>
+
+                    <div className='translation-member-panel__members-head'>
+
+                        <div className='translation-member-panel__title'>Channel members</div>
+
+                        <div className='translation-member-panel__hint-block'>
+
+                            Each badge is that person&apos;s receive language (visible to everyone).
+
+                        </div>
+
+                    </div>
+
+                    <div className='translation-member-panel__list'>
+
+                        {loading && <div className='translation-member-panel__hint'>Loading…</div>}
+
+                        {error && <div className='translation-member-panel__error'>{error}</div>}
+
+                        {!loading && !error && displayMembers.length === 0 && (
+                            <div className='translation-member-panel__hint'>No channel members found.</div>
+                        )}
+
+                        {!loading && !error && displayMembers.map((member) => {
+                            const isYou = member.user_id === currentUserId;
+                            const displayName = member.display_name || member.username;
+
+                            return (
+                                <div
+                                    key={member.user_id}
+                                    className={`translation-member-panel__row${isYou ? ' translation-member-panel__row--you' : ''}`}
+                                >
+                                    <div className='translation-member-panel__person'>
+                                        <span
+                                            className='translation-member-panel__avatar'
+                                            aria-hidden='true'
+                                        >
+                                            {memberInitial(displayName)}
+                                        </span>
+                                        <span className='translation-member-panel__name'>
+                                            {displayName}
+                                            {isYou && <span className='translation-member-panel__you-tag'>You</span>}
+                                        </span>
+                                    </div>
+
+                                    <span
+                                        className='translation-member-panel__badge'
+                                        title={getLanguageLabel(member.target_language)}
+                                    >
+                                        {languageShortCode(member.target_language)}
+                                    </span>
+                                </div>
+                            );
+                        })}
+
+                    </div>
+
+                </section>
 
             </div>
 

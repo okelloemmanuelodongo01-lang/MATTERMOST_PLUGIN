@@ -7,6 +7,7 @@ import type {Post} from '@mattermost/types/posts';
 import type {GlobalState} from '@mattermost/types/store';
 
 import PostSpeakBar from './post_speak_bar';
+import TranslationAttachment from './translation_attachment';
 import {isVideoNotePost} from '../video_post_utils';
 import {isVoiceNotePost} from '../voice_post_utils';
 
@@ -38,7 +39,12 @@ function TranslationAttachmentWrapperInner(props: Props) {
         return null;
     }
 
-    return <PostSpeakBar post={post} />;
+    return (
+        <>
+            <TranslationAttachment post={post} />
+            <PostSpeakBar post={post} />
+        </>
+    );
 }
 
 export default connect()(TranslationAttachmentWrapperInner);

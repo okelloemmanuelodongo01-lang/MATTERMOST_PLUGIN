@@ -8,6 +8,7 @@ import type {Theme} from '@mattermost/types/theme';
 
 import VoiceNotePlayer from './voice_note_player';
 import MediaTranscriptPanel from './media_transcript_panel';
+import MediaAuthorPanel from './media_author_panel';
 import PostSpeakBar from './post_speak_bar';
 
 import {getVoiceDurationMs, getVoiceFileId} from '../voice_post_utils';
@@ -54,6 +55,7 @@ export default function VoiceNotePost({post}: Props) {
             )}
 
             <MediaTranscriptPanel post={post} />
+            <MediaAuthorPanel post={post} />
             <PostSpeakBar post={post} />
 
         </div>

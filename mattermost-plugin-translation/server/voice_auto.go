@@ -8,11 +8,42 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/mattermost/mattermost/server/public/model"
 )
+
+var japaneseRomanizedRE = regexp.MustCompile(`(?i)\b(arigat[oō]?|sayonara|konnichiwa|ohay[oō]|sumimasen|ogenki|itadakimasu|moshi\s+moshi|hai|iie|onegaishimasu|gomennasai)\b`)
+var koreanRomanizedRE = regexp.MustCompile(`(?i)\b(annyeong|annyeonghaseyo|kamsahamnida|gamsahamnida|saranghae|mianhae)\b`)
+
+func inferSpokenLanguageFromTranscript(transcript, sttLang string) string {
+	text := strings.TrimSpace(transcript)
+	source := normalizeLangCode(sttLang)
+	if text == "" {
+		return source
+	}
+
+	for _, r := range text {
+		if (r >= 0x3040 && r <= 0x30ff) || (r >= 0x3400 && r <= 0x9fff) {
+			return "ja"
+		}
+		if r >= 0xac00 && r <= 0xd7af {
+			return "ko"
+		}
+	}
+
+	lower := strings.ToLower(text)
+	if japaneseRomanizedRE.MatchString(lower) && (source == "" || source == "en") {
+		return "ja"
+	}
+	if koreanRomanizedRE.MatchString(lower) && (source == "" || source == "en") {
+		return "ko"
+	}
+
+	return source
+}
 
 func isVoiceNotePost(post *model.Post) bool {
 	if post == nil {
@@ -26,7 +57,7 @@ func isVoiceNotePost(post *model.Post) bool {
 			return true
 		}
 	}
-	return len(post.FileIds) > 0
+	return false
 }
 
 func (p *Plugin) postHasAudioFile(post *model.Post) bool {
@@ -308,21 +339,62 @@ func (p *Plugin) transcribeBytesDetailed(post *model.Post, data []byte, fileName
 	}
 
 	ctx := context.Background()
-	candidates := p.getChannelSTTLanguageCandidates(post)
+	// Only reuse language detected from a prior transcription of this same recording.
+	// Spoken language is auto-detected from audio — not from user text receive-language settings.
+	languageHint := p.mediaLanguageHintFromPost(post)
 
-	result, err := p.callSTTAPI(ctx, data, fileName, mimeType, "", candidates)
+	// Channel receive languages narrow STT auto-detect (e.g. ja + en in Town Square) without fixing one speaker language.
+	channelLanguages := p.getChannelSTTLanguageCandidates(post)
+
+	result, err := p.callSTTAPI(ctx, data, fileName, mimeType, languageHint, channelLanguages)
 	if err != nil {
 		return sttResult{}, err
 	}
 
-	if p.shouldRetryMediaSTT(result) && normalizeLangCode(result.DetectedLanguage) != "" {
-		retry, retryErr := p.callSTTAPI(ctx, data, fileName, mimeType, result.DetectedLanguage, candidates)
-		if retryErr == nil && p.preferMediaSTTResult(retry, result, result.DetectedLanguage) {
-			result = retry
+	if p.shouldRetryMediaSTT(result) {
+		retryHint := inferSpokenLanguageFromTranscript(result.Text, result.DetectedLanguage)
+		if retryHint == "" {
+			retryHint = result.DetectedLanguage
+		}
+		if strings.TrimSpace(retryHint) != "" {
+			retry, retryErr := p.callSTTAPI(ctx, data, fileName, mimeType, retryHint, channelLanguages)
+			if retryErr == nil && p.preferMediaSTTResult(retry, result, retryHint) {
+				result = retry
+			}
 		}
 	}
 
 	return result, nil
+}
+
+func (p *Plugin) resolveMediaText(post *model.Post) (text string, detectedLang string, err error) {
+	if post == nil {
+		return "", "", fmt.Errorf("post not found")
+	}
+
+	text = strings.TrimSpace(mediaTranscriptFromPost(post))
+	detectedLang = strings.TrimSpace(p.mediaLanguageHintFromPost(post))
+	if text != "" && !isPlaceholderMediaText(text, post) {
+		return text, detectedLang, nil
+	}
+
+	transcribed, err := p.transcribeMediaPostDetailed(post)
+	if err != nil {
+		return "", "", err
+	}
+
+	text = strings.TrimSpace(transcribed.Text)
+	detectedLang = strings.TrimSpace(transcribed.DetectedLanguage)
+	if text == "" || isPlaceholderMediaText(text, post) {
+		return "", "", fmt.Errorf("no speech detected in this recording")
+	}
+
+	p.saveMediaTranscript(post, text)
+	if detectedLang != "" {
+		p.saveMediaDetectedLanguage(post, detectedLang)
+	}
+
+	return text, detectedLang, nil
 }
 
 func (p *Plugin) getChannelSTTLanguageCandidates(post *model.Post) []string {
@@ -349,8 +421,8 @@ func (p *Plugin) getChannelSTTLanguageCandidates(post *model.Post) []string {
 		add(p.getUserTargetLanguage(userID))
 	}
 
-	if len(codes) > 8 {
-		codes = codes[:8]
+	if len(codes) > 32 {
+		codes = codes[:32]
 	}
 	return codes
 }
@@ -375,7 +447,15 @@ func (p *Plugin) shouldRetryMediaSTT(result sttResult) bool {
 		return true
 	}
 
-	return detected == "" || len(text) < 10
+	if detected == "" {
+		return true
+	}
+
+	if inferred := inferSpokenLanguageFromTranscript(text, detected); inferred != "" && inferred != detected {
+		return true
+	}
+
+	return len(text) < 10
 }
 
 func (p *Plugin) preferMediaSTTResult(retry, first sttResult, preferredLang string) bool {
@@ -402,11 +482,30 @@ func (p *Plugin) mediaLanguageHintFromPost(post *model.Post) string {
 		if lang, ok := post.Props["video_detected_language"].(string); ok && strings.TrimSpace(lang) != "" {
 			return strings.TrimSpace(lang)
 		}
+		if lang, ok := post.Props["video_language"].(string); ok && strings.TrimSpace(lang) != "" {
+			return normalizeLangCode(strings.TrimSpace(lang))
+		}
 	}
 	if lang, ok := post.Props["voice_detected_language"].(string); ok && strings.TrimSpace(lang) != "" {
 		return strings.TrimSpace(lang)
 	}
+	if lang, ok := post.Props["voice_language"].(string); ok && strings.TrimSpace(lang) != "" {
+		return normalizeLangCode(strings.TrimSpace(lang))
+	}
 	return ""
+}
+
+func isMediaLanguageUncertain(result sttResult) bool {
+	text := strings.TrimSpace(result.Text)
+	if text == "" {
+		return true
+	}
+	detected := normalizeLangCode(result.DetectedLanguage)
+	if detected == "" {
+		return true
+	}
+	inferred := inferSpokenLanguageFromTranscript(text, detected)
+	return inferred != "" && inferred != detected
 }
 
 func (p *Plugin) mediaLanguageFromPost(post *model.Post) string {

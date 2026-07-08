@@ -1,5 +1,7 @@
 import React from 'react';
 
+import PreferenceSelect from './preference_select';
+
 export type VoiceGender = 'male' | 'female' | 'neutral';
 
 type Props = {
@@ -9,29 +11,21 @@ type Props = {
     onChange: (value: VoiceGender) => void;
 };
 
-const OPTIONS: Array<{value: VoiceGender; label: string}> = [
-    {value: 'neutral', label: 'Neutral (Google default)'},
+const OPTIONS = [
+    {value: 'neutral', label: 'Neutral'},
     {value: 'female', label: 'Female'},
     {value: 'male', label: 'Male'},
 ];
 
 export default function VoiceGenderSelect({value, disabled, className = '', onChange}: Props) {
     return (
-        <select
+        <PreferenceSelect
             className={`translation-voice-gender-select ${className}`.trim()}
             value={value}
+            options={OPTIONS}
             disabled={disabled}
-            onChange={(event) => onChange(event.target.value as VoiceGender)}
             aria-label='Read-aloud voice'
-        >
-            {OPTIONS.map((option) => (
-                <option
-                    key={option.value}
-                    value={option.value}
-                >
-                    {option.label}
-                </option>
-            ))}
-        </select>
+            onChange={(next) => onChange(next as VoiceGender)}
+        />
     );
 }

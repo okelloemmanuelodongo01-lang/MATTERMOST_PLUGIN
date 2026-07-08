@@ -27,7 +27,7 @@ type cachedTranslation struct {
 }
 
 func (p *Plugin) cacheKey(text, from, to, hintLanguage string) string {
-	hash := sha256.Sum256([]byte(strings.TrimSpace(text) + "|" + from + "|" + to + "|" + hintLanguage))
+	hash := sha256.Sum256([]byte("v6-embedding-sync|" + strings.TrimSpace(text) + "|" + from + "|" + to + "|" + hintLanguage))
 	return "translation:" + hex.EncodeToString(hash[:])
 }
 
@@ -144,7 +144,51 @@ func (p *Plugin) TranslateMessage(userID, postID, text, to string) (string, erro
 	), nil
 }
 
-func (p *Plugin) publishTranslationResult(userID, postID string, result *TranslationResult, cached, sameLanguage, auto bool) {
+func (p *Plugin) publishTranslationResult(userID, postID string, result *TranslationResult, cached, sameLanguage, auto bool, languageUncertain bool) {
+	p.publishTranslationDelivered(userID, postID, result, cached, sameLanguage, auto, languageUncertain)
+	if result != nil && result.HasEvaluation() {
+		p.publishTranslationEvaluated(userID, postID, result, cached)
+	}
+}
+
+func (p *Plugin) publishTranslationDelivered(userID, postID string, result *TranslationResult, cached, sameLanguage, auto bool, languageUncertain bool) {
+	if result == nil {
+		return
+	}
+
+	payload := map[string]interface{}{
+		"post_id":       postID,
+		"origin":        result.Origin,
+		"translated":    result.Translated,
+		"from":          result.From,
+		"to":            result.To,
+		"detected_from": result.DetectedFrom,
+		"engine":        result.Engine,
+		"cached":        cached,
+		"same_language": sameLanguage,
+		"auto":          auto,
+	}
+	if languageUncertain {
+		payload["language_uncertain"] = true
+	}
+
+	p.API.PublishWebSocketEvent("translation_delivered", payload, &model.WebsocketBroadcast{
+		UserId: userID,
+	})
+}
+
+func (p *Plugin) publishMediaTranslationProgress(userID, postID, stage string) {
+	p.API.PublishWebSocketEvent("translation_media_progress", map[string]interface{}{
+		"post_id": postID,
+		"stage":   stage,
+	}, &model.WebsocketBroadcast{UserId: userID})
+}
+
+func (p *Plugin) publishTranslationEvaluated(userID, postID string, result *TranslationResult, cached bool) {
+	if result == nil {
+		return
+	}
+
 	payload := map[string]interface{}{
 		"post_id":         postID,
 		"origin":          result.Origin,
@@ -159,9 +203,11 @@ func (p *Plugin) publishTranslationResult(userID, postID string, result *Transla
 		"embedding_score": result.EmbeddingScore,
 		"quality_score":   result.QualityScore,
 		"cached":          cached,
-		"same_language":   sameLanguage,
-		"auto":            auto,
 	}
+
+	p.API.PublishWebSocketEvent("translation_evaluated", payload, &model.WebsocketBroadcast{
+		UserId: userID,
+	})
 
 	p.API.PublishWebSocketEvent("translation_result", payload, &model.WebsocketBroadcast{
 		UserId: userID,
@@ -180,6 +226,7 @@ func (p *Plugin) handleTranslate(w http.ResponseWriter, r *http.Request) {
 	text := strings.TrimSpace(req.Text)
 	mediaTranslateHint := ""
 	isMediaPost := false
+	needsMediaSTT := false
 	var mediaPost *model.Post
 	if req.PostID != "" {
 		post, appErr := p.API.GetPost(req.PostID)
@@ -190,19 +237,12 @@ func (p *Plugin) handleTranslate(w http.ResponseWriter, r *http.Request) {
 		if isMediaNotePost(post) {
 			isMediaPost = true
 			mediaPost = post
-			transcribed, err := p.transcribeMediaPostDetailed(post)
-			if err != nil {
-				p.API.LogWarn("Media STT failed", "post_id", req.PostID, "error", err.Error())
-				http.Error(w, "Could not transcribe media message: "+err.Error(), http.StatusBadRequest)
-				return
-			}
-			text = strings.TrimSpace(transcribed.Text)
-			mediaTranslateHint = strings.TrimSpace(transcribed.DetectedLanguage)
-			if text != "" {
-				p.saveMediaTranscript(post, text)
-				if mediaTranslateHint != "" {
-					p.saveMediaDetectedLanguage(post, mediaTranslateHint)
-				}
+			cachedText := strings.TrimSpace(mediaTranscriptFromPost(post))
+			if cachedText != "" && !isPlaceholderMediaText(cachedText, post) {
+				text = cachedText
+				mediaTranslateHint = strings.TrimSpace(p.mediaLanguageHintFromPost(post))
+			} else {
+				needsMediaSTT = true
 			}
 		} else {
 			if text == "" {
@@ -214,7 +254,7 @@ func (p *Plugin) handleTranslate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if text == "" {
+	if text == "" && !needsMediaSTT {
 		http.Error(w, "No text available to translate. For voice or video messages, record again in Chrome/Edge or configure STT in plugin settings.", http.StatusBadRequest)
 		return
 	}
@@ -225,7 +265,7 @@ func (p *Plugin) handleTranslate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	from := strings.TrimSpace(req.From)
-	if isMediaPost && mediaPost != nil {
+	if isMediaPost && mediaPost != nil && text != "" {
 		from = p.mediaTranslationSourceLanguage(mediaTranslateHint, mediaPost, text)
 	}
 
@@ -233,7 +273,21 @@ func (p *Plugin) handleTranslate(w http.ResponseWriter, r *http.Request) {
 		cacheKey := p.cacheKey(text, from, to, "")
 		if cached, ok := p.getCachedTranslation(cacheKey); ok {
 			sameLanguage := isSameLanguage(cached.DetectedFrom, to)
-			p.publishTranslationResult(userID, req.PostID, cached, true, sameLanguage, false)
+			p.publishTranslationResult(userID, req.PostID, cached, true, sameLanguage, false, false)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":        "complete",
+				"cached":        true,
+				"same_language": sameLanguage,
+				"result":        cached,
+			})
+			return
+		}
+	} else if text != "" {
+		cacheKey := p.cacheKey(text, from, to, "")
+		if cached, ok := p.getCachedTranslation(cacheKey); ok {
+			sameLanguage := p.translationSameLanguage(true, mediaTranslateHint, from, to, text, cached)
+			p.publishMediaTranslationDelivered(userID, req.PostID, cached, true, sameLanguage, false, false)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"status":        "complete",
@@ -256,14 +310,63 @@ func (p *Plugin) handleTranslate(w http.ResponseWriter, r *http.Request) {
 		var result *TranslationResult
 		var cached bool
 		var err error
+		languageUncertain := false
+		workingText := text
+		workingHint := mediaTranslateHint
+		workingFrom := from
+
+		if isMediaPost && needsMediaSTT && mediaPost != nil {
+			p.publishMediaTranslationProgress(userID, req.PostID, "transcribing")
+			transcribed, sttErr := p.transcribeMediaPostDetailed(mediaPost)
+			if sttErr != nil {
+				p.API.PublishWebSocketEvent("translation_error", map[string]interface{}{
+					"post_id": req.PostID,
+					"error":   "Could not transcribe media message: " + sttErr.Error(),
+				}, &model.WebsocketBroadcast{UserId: userID})
+				p.API.LogWarn("Media STT failed", "post_id", req.PostID, "error", sttErr.Error())
+				return
+			}
+
+			workingText = strings.TrimSpace(transcribed.Text)
+			workingHint = strings.TrimSpace(transcribed.DetectedLanguage)
+			if workingText == "" || isPlaceholderMediaText(workingText, mediaPost) {
+				p.API.PublishWebSocketEvent("translation_error", map[string]interface{}{
+					"post_id": req.PostID,
+					"error":   "No speech detected in this recording",
+				}, &model.WebsocketBroadcast{UserId: userID})
+				return
+			}
+
+			p.saveMediaTranscript(mediaPost, workingText)
+			if workingHint != "" {
+				p.saveMediaDetectedLanguage(mediaPost, workingHint)
+			}
+			languageUncertain = isMediaLanguageUncertain(transcribed)
+
+			p.publishMediaTranslationProgress(userID, req.PostID, "detecting")
+			workingFrom = p.mediaTranslationSourceLanguage(workingHint, mediaPost, workingText)
+		} else if isMediaPost && mediaPost != nil {
+			p.publishMediaTranslationProgress(userID, req.PostID, "detecting")
+			workingFrom = p.mediaTranslationSourceLanguage(workingHint, mediaPost, workingText)
+		}
 
 		if isMediaPost {
-			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-			defer cancel()
-			result, err = p.callTranslationAPI(ctx, text, to, from, "", true)
-			cached = false
+			p.publishMediaTranslationProgress(userID, req.PostID, "translating")
+			cacheKey := p.cacheKey(workingText, workingFrom, to, "")
+			if cachedResult, ok := p.getCachedTranslation(cacheKey); ok {
+				result = cachedResult
+				cached = true
+			} else {
+				ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+				defer cancel()
+				result, err = p.callTranslationAPI(ctx, workingText, to, workingFrom, "", true)
+				cached = false
+				if err == nil && result != nil {
+					p.storeCachedTranslation(cacheKey, result)
+				}
+			}
 		} else {
-			result, cached, err = p.translateWithCache(text, from, to, "")
+			result, cached, err = p.translateWithCache(workingText, workingFrom, to, "")
 		}
 
 		if err != nil {
@@ -275,13 +378,45 @@ func (p *Plugin) handleTranslate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		sameLanguage := p.translationSameLanguage(isMediaPost, mediaTranslateHint, from, to, text, result)
-		p.publishTranslationResult(userID, req.PostID, result, cached, sameLanguage, false)
+		sameLanguage := p.translationSameLanguage(isMediaPost, workingHint, workingFrom, to, workingText, result)
+		if isMediaPost {
+			p.publishMediaTranslationDelivered(userID, req.PostID, result, cached, sameLanguage, false, languageUncertain)
+		} else {
+			p.publishTranslationResult(userID, req.PostID, result, cached, sameLanguage, false, false)
+		}
 	}()
 }
 
+func (p *Plugin) publishMediaTranslationDelivered(userID, postID string, result *TranslationResult, cached, sameLanguage, auto bool, languageUncertain bool) {
+	if result == nil {
+		return
+	}
+	p.publishTranslationDelivered(userID, postID, result, cached, sameLanguage, auto, languageUncertain)
+	if result.HasEvaluation() {
+		p.publishTranslationEvaluated(userID, postID, result, cached)
+		return
+	}
+
+	resultCopy := *result
+	post, appErr := p.API.GetPost(postID)
+	text := strings.TrimSpace(result.Origin)
+	from := strings.TrimSpace(result.From)
+	if post != nil && appErr == nil && isMediaNotePost(post) {
+		if transcript := strings.TrimSpace(mediaTranscriptFromPost(post)); transcript != "" {
+			text = transcript
+		}
+		sttLang := strings.TrimSpace(p.mediaLanguageHintFromPost(post))
+		from = p.mediaTranslationSourceLanguage(sttLang, post, text)
+	}
+	if text == "" {
+		text = strings.TrimSpace(resultCopy.Origin)
+	}
+	to := strings.TrimSpace(result.To)
+	go p.evaluateSyncEntry(userID, postID, text, from, to, "", &resultCopy)
+}
+
 func (p *Plugin) mediaTranslationSourceLanguage(sttLang string, post *model.Post, transcript string) string {
-	source := normalizeLangCode(sttLang)
+	source := inferSpokenLanguageFromTranscript(transcript, sttLang)
 	if source != "" {
 		return source
 	}
@@ -292,7 +427,6 @@ func (p *Plugin) mediaTranslationSourceLanguage(sttLang string, post *model.Post
 		}
 	}
 
-	_ = transcript
 	return source
 }
 
@@ -325,8 +459,100 @@ type syncPostInput struct {
 	Text string `json:"text"`
 }
 
+type evaluateAPIRequest struct {
+	PostID         string `json:"post_id"`
+	TargetLanguage string `json:"target_language"`
+	Text           string `json:"text"`
+}
+
+func (p *Plugin) handleEvaluate(w http.ResponseWriter, r *http.Request) {
+	userID := r.Header.Get("Mattermost-User-ID")
+
+	var req evaluateAPIRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	postID := strings.TrimSpace(req.PostID)
+	if postID == "" {
+		http.Error(w, "post_id is required", http.StatusBadRequest)
+		return
+	}
+
+	text := strings.TrimSpace(req.Text)
+	from := ""
+	hint := ""
+	if text == "" {
+		post, appErr := p.getPostWithRetry(postID, 3)
+		if appErr != nil || post == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "Could not load post. Tap the chevron to retry."})
+			return
+		}
+		if isMediaNotePost(post) {
+			text = strings.TrimSpace(mediaTranscriptFromPost(post))
+			if text == "" || isPlaceholderMediaText(text, post) {
+				http.Error(w, "No transcript available yet. Translate the voice or video message first.", http.StatusBadRequest)
+				return
+			}
+			sttLang := strings.TrimSpace(p.mediaLanguageHintFromPost(post))
+			from = p.mediaTranslationSourceLanguage(sttLang, post, text)
+		} else {
+			text = strings.TrimSpace(post.Message)
+		}
+	}
+	if text == "" {
+		http.Error(w, "post has no text", http.StatusBadRequest)
+		return
+	}
+
+	to := strings.TrimSpace(req.TargetLanguage)
+	if to == "" {
+		to = p.getUserTargetLanguage(userID)
+	}
+
+	var deliver *TranslationResult
+	var cached bool
+	var err error
+	if from != "" {
+		deliver, cached, err = p.translateWithCacheFast(text, from, to, hint)
+	} else {
+		deliver, cached, err = p.translateDeliverWithCache(text, "", to, hint)
+	}
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	evaluated := p.ensureEvaluated(text, from, to, hint, deliver)
+	p.publishTranslationEvaluated(userID, postID, evaluated, cached)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"post_id":         postID,
+		"status":          "complete",
+		"cached":          cached,
+		"origin":          evaluated.Origin,
+		"translated":      evaluated.Translated,
+		"from":            evaluated.From,
+		"to":              evaluated.To,
+		"detected_from":   evaluated.DetectedFrom,
+		"engine":          evaluated.Engine,
+		"reversed":        evaluated.Reversed,
+		"score":           evaluated.Score,
+		"semantic_score":  evaluated.SemanticScore,
+		"embedding_score": evaluated.EmbeddingScore,
+		"quality_score":   evaluated.QualityScore,
+	})
+}
+
 type syncAPIRequest struct {
-	Posts []syncPostInput `json:"posts"`
+	Posts           []syncPostInput `json:"posts"`
+	TargetLanguage  string          `json:"target_language"`
 }
 
 type syncTranslationEntry struct {
@@ -356,6 +582,10 @@ func (p *Plugin) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if clientLang := normalizeLangCode(strings.TrimSpace(req.TargetLanguage)); clientLang != "" {
+		to = clientLang
+	}
+
 	if len(req.Posts) == 0 {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"translations": []syncTranslationEntry{}})
@@ -367,40 +597,60 @@ func (p *Plugin) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := make([]syncTranslationEntry, 0, len(req.Posts))
+
 	for _, item := range req.Posts {
 		text := strings.TrimSpace(item.Text)
 		if text == "" || item.ID == "" {
 			continue
 		}
 
-		result, cached, err := p.translateWithCache(text, "", to, "")
+		var post *model.Post
+		if fetched, appErr := p.API.GetPost(item.ID); appErr == nil {
+			post = fetched
+		}
+
+		// Reader translations only — author delivery uses GET /author-summary.
+		if post != nil && post.UserId == userID {
+			continue
+		}
+
+		targetLang := to
+		result, cached, err := p.translateDeliverWithCache(text, "", targetLang, "")
 		if err != nil {
 			p.API.LogWarn("Sync translation failed", "post_id", item.ID, "error", err.Error())
 			continue
 		}
 
-		sameLanguage := isSameLanguage(result.DetectedFrom, to)
-		results = append(results, syncTranslationEntry{
-			PostID:        item.ID,
-			Origin:        result.Origin,
-			Translated:    result.Translated,
-			From:          result.From,
-			To:            result.To,
-			DetectedFrom:  result.DetectedFrom,
-			Engine:        result.Engine,
-			Reversed:      result.Reversed,
+		sameLanguage := isSameLanguage(result.DetectedFrom, targetLang)
+
+		entry := syncTranslationEntry{
+			PostID:         item.ID,
+			Origin:         result.Origin,
+			Translated:     result.Translated,
+			From:           result.From,
+			To:             result.To,
+			DetectedFrom:   result.DetectedFrom,
+			Engine:         result.Engine,
+			Reversed:       result.Reversed,
 			Score:          result.Score,
 			SemanticScore:  result.SemanticScore,
 			EmbeddingScore: result.EmbeddingScore,
 			QualityScore:   result.QualityScore,
-			Cached:        cached,
-			SameLanguage:  sameLanguage,
-		})
+			Cached:         cached,
+			SameLanguage:   sameLanguage,
+		}
+		results = append(results, entry)
+
+		if !result.HasEvaluation() && text != "" {
+			postID := item.ID
+			deliverCopy := *result
+			go p.evaluateSyncEntry(userID, postID, text, "", targetLang, "", &deliverCopy)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"translations": results,
+		"translations":    results,
 		"target_language": to,
 	})
 }

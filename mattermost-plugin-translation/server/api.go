@@ -16,6 +16,8 @@ func (p *Plugin) initRouter() *mux.Router {
 	apiRouter.HandleFunc("/speak", p.handleSpeak).Methods(http.MethodPost)
 	apiRouter.HandleFunc("/speak/resolve", p.handleSpeakResolve).Methods(http.MethodPost)
 	apiRouter.HandleFunc("/sync", p.handleSync).Methods(http.MethodPost)
+	apiRouter.HandleFunc("/evaluate", p.handleEvaluate).Methods(http.MethodPost)
+	apiRouter.HandleFunc("/author-summary", p.handleAuthorSummary).Methods(http.MethodGet, http.MethodPost)
 	apiRouter.HandleFunc("/preview", p.handlePreview).Methods(http.MethodPost)
 	apiRouter.HandleFunc("/config", p.handleGetConfig).Methods(http.MethodGet)
 	apiRouter.HandleFunc("/languages", p.handleLanguages).Methods(http.MethodGet)

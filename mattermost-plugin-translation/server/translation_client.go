@@ -26,40 +26,137 @@ type TranslationResult struct {
 }
 
 type translateRequestBody struct {
-	Text         string `json:"text"`
+	Text         string `json:"text,omitempty"`
 	To           string `json:"to"`
 	From         string `json:"from,omitempty"`
 	HintLanguage string `json:"hint_language,omitempty"`
 	Fast         bool   `json:"fast,omitempty"`
+	Phase        string `json:"phase,omitempty"`
+	Origin       string `json:"origin,omitempty"`
+	Translated   string `json:"translated,omitempty"`
+	DetectedFrom string `json:"detected_from,omitempty"`
+	Engine       string `json:"engine,omitempty"`
+}
+
+func (r *TranslationResult) HasEvaluation() bool {
+	return strings.TrimSpace(r.Reversed) != "" && (r.QualityScore > 0 || r.Score > 0)
+}
+
+func (r *TranslationResult) MergeEvaluation(other *TranslationResult) {
+	if other == nil {
+		return
+	}
+	if other.Reversed != "" {
+		r.Reversed = other.Reversed
+	}
+	if other.Score > 0 {
+		r.Score = other.Score
+	}
+	if other.SemanticScore > 0 {
+		r.SemanticScore = other.SemanticScore
+	}
+	if other.EmbeddingScore > 0 {
+		r.EmbeddingScore = other.EmbeddingScore
+	}
+	if other.QualityScore > 0 {
+		r.QualityScore = other.QualityScore
+	}
+	if other.Engine != "" && !strings.Contains(r.Engine, ":evaluate") {
+		r.Engine = other.Engine
+	}
 }
 
 func (p *Plugin) callTranslationAPI(ctx context.Context, text, to, from, hintLanguage string, fast bool) (*TranslationResult, error) {
-	config := p.getConfiguration()
-
-	body, err := json.Marshal(translateRequestBody{
+	phase := ""
+	if fast {
+		return p.postTranslationAPI(ctx, translateRequestBody{
+			Text:         text,
+			To:           to,
+			From:         from,
+			HintLanguage: hintLanguage,
+			Fast:         true,
+		}, 120*time.Second)
+	}
+	return p.postTranslationAPI(ctx, translateRequestBody{
 		Text:         text,
 		To:           to,
 		From:         from,
 		HintLanguage: hintLanguage,
-		Fast:         fast,
-	})
+		Phase:        phase,
+	}, 90*time.Second)
+}
+
+func (p *Plugin) callTranslationDeliverAPI(ctx context.Context, text, to, from, hintLanguage string) (*TranslationResult, error) {
+	return p.postTranslationAPI(ctx, translateRequestBody{
+		Text:         text,
+		To:           to,
+		From:         from,
+		HintLanguage: hintLanguage,
+		Phase:        "deliver",
+	}, 45*time.Second)
+}
+
+func (p *Plugin) callTranslationEvaluateAPI(ctx context.Context, deliver *TranslationResult) (*TranslationResult, error) {
+	if deliver == nil {
+		return nil, fmt.Errorf("deliver result is required")
+	}
+	origin := strings.TrimSpace(deliver.Origin)
+	if origin == "" {
+		origin = strings.TrimSpace(deliver.Translated)
+	}
+	engine := deliver.Engine
+	engine = strings.TrimSuffix(engine, ":deliver")
+	return p.postTranslationAPI(ctx, translateRequestBody{
+		To:           deliver.To,
+		From:         deliver.From,
+		DetectedFrom: deliver.DetectedFrom,
+		Engine:       engine,
+		Phase:        "evaluate",
+		Origin:       origin,
+		Translated:   deliver.Translated,
+	}, 90*time.Second)
+}
+
+func (p *Plugin) postTranslationAPI(ctx context.Context, body translateRequestBody, timeout time.Duration) (*TranslationResult, error) {
+	config := p.getConfiguration()
+
+	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
 
 	baseURL := strings.TrimRight(config.TranslationAPIURL, "/")
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/translate", bytes.NewReader(body))
+	endpoint := baseURL + "/translate"
+	if body.Phase == "deliver" {
+		endpoint = baseURL + "/translate/deliver"
+		body.Phase = ""
+		payload, err = json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+	} else if body.Phase == "evaluate" {
+		endpoint = baseURL + "/translate/evaluate"
+		evalBody := map[string]string{
+			"origin":        body.Origin,
+			"translated":    body.Translated,
+			"to":            body.To,
+			"from":          body.From,
+			"detected_from": body.DetectedFrom,
+			"engine":        body.Engine,
+		}
+		payload, err = json.Marshal(evalBody)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-API-Key", config.TranslationAPIKey)
-
-	timeout := 60 * time.Second
-	if fast {
-		timeout = 120 * time.Second
-	}
 
 	client := &http.Client{Timeout: timeout}
 	resp, err := p.doHTTPWithRetry(client, req, 2)

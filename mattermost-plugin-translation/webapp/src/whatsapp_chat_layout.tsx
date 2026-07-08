@@ -1,11 +1,15 @@
 import React from 'react';
 import type {Store} from 'redux';
 import type {GlobalState} from '@mattermost/types/store';
+import {scheduleInlineTranslationToggleSync} from './inline_translation_toggle';
 
 const POST_LIST_ROOTS = [
     '#post-list',
     '#channel_view .post-list__dynamic',
     '.post-list__content',
+    '#threadViewer',
+    '.ThreadViewer',
+    '#rhsContainer',
 ];
 
 function getPostListRoot(): Element | null {
@@ -16,6 +20,20 @@ function getPostListRoot(): Element | null {
         }
     }
     return null;
+}
+
+function channelPostCount(state: GlobalState, channelId: string): number {
+    if (!channelId) {
+        return 0;
+    }
+
+    const blocks = state.entities?.posts?.postsInChannel?.[channelId];
+    if (!blocks?.length) {
+        return 0;
+    }
+
+    const recentBlock = blocks.find((block) => block.recent) || blocks[0];
+    return recentBlock?.order?.length || 0;
 }
 
 export function tagWhatsAppPosts(store: Store<GlobalState>): void {
@@ -38,17 +56,18 @@ export function tagWhatsAppPosts(store: Store<GlobalState>): void {
             return;
         }
 
-        const postId = node.id?.startsWith('post_') ? node.id.slice(5) : node.id;
+        const postId = node.getAttribute('data-post-id') ||
+            (node.id?.startsWith('post_') ? node.id.slice(5) : node.id);
         if (!postId) {
             return;
         }
 
         const post = posts[postId];
-        if (!post?.user_id) {
-            return;
-        }
+        const isSent = post?.user_id
+            ? post.user_id === currentUserId
+            : node.classList.contains('current--user');
 
-        const isSent = post.user_id === currentUserId;
+        node.setAttribute('data-post-id', postId);
         node.classList.toggle('translation-wa--sent', isSent);
         node.classList.toggle('translation-wa--received', !isSent);
     });
@@ -73,6 +92,7 @@ export default function WhatsAppChatLayout({getStore}: Props) {
                 const store = getStore();
                 if (store) {
                     tagWhatsAppPosts(store);
+                    scheduleInlineTranslationToggleSync(store);
                 }
             });
         };
@@ -93,7 +113,19 @@ export default function WhatsAppChatLayout({getStore}: Props) {
         scheduleTag();
 
         const store = getStore();
-        const unsubscribe = store?.subscribe(scheduleTag);
+        let lastTagKey = '';
+        const unsubscribe = store?.subscribe(() => {
+            const state = store.getState();
+            const channelId = state.entities?.channels?.currentChannelId || '';
+            const currentUserId = state.entities?.users?.currentUserId || '';
+            const postCount = channelPostCount(state, channelId);
+            const tagKey = `${channelId}:${currentUserId}:${postCount}`;
+            if (tagKey === lastTagKey) {
+                return;
+            }
+            lastTagKey = tagKey;
+            scheduleTag();
+        });
 
         const retry = window.setInterval(() => {
             scheduleTag();

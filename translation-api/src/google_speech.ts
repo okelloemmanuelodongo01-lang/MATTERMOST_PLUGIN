@@ -1,13 +1,15 @@
 import {float32ToWav} from './audio_wav.js';
 import {GOOGLE_SPEECH_SYNC_MAX_SECONDS, normalizeSpeechLanguageCode, toSpeechBcp47} from './speech_bcp47.js';
 import {fetchWithRetry} from './fetch_retry.js';
+import {getSampledSpeechRotations} from './speech_language_catalog.js';
+import {detectLanguageWithGoogle, isGoogleTranslateEnabled} from './google.js';
 
 const GOOGLE_SPEECH_API_KEY =
   process.env.GOOGLE_SPEECH_API_KEY?.trim() ||
   process.env.GOOGLE_TRANSLATE_API_KEY?.trim() ||
   '';
 
-/** Fallback when no channel context — rotated in multi-pass auto-detect. */
+/** Broad auto-detect rotations — fast and reliable (same approach as earlier working builds). */
 const AUTO_DETECT_ROTATIONS: string[][] = [
   ['en-US', 'fr-FR', 'ja-JP', 'ar-SA'],
   ['sw-KE', 'de-DE', 'es-ES', 'pt-BR'],
@@ -16,6 +18,7 @@ const AUTO_DETECT_ROTATIONS: string[][] = [
 ];
 
 const CHUNK_SECONDS = 50;
+const STT_FALLBACK_SAMPLE_BATCHES = Number(process.env.STT_FALLBACK_SAMPLE_BATCHES || 8);
 
 export function isGoogleSpeechEnabled(): boolean {
   return GOOGLE_SPEECH_API_KEY.length > 0;
@@ -77,6 +80,9 @@ export function buildLanguageConfig(languageHint?: string, languageCandidates?: 
 }
 
 function speechModel(durationSeconds?: number, explicitLanguage?: boolean): string {
+  if (durationSeconds && durationSeconds <= 15) {
+    return 'latest_short';
+  }
   if (durationSeconds && durationSeconds > 12) {
     return 'latest_long';
   }
@@ -217,6 +223,93 @@ function scoreGoogleResult(result: RecognizeResult): number {
   return result.text.length + result.confidence * 50;
 }
 
+async function lockLanguageWithGoogleDetect(result: RecognizeResult): Promise<RecognizeResult> {
+  if (!isGoogleTranslateEnabled() || !result.text.trim()) {
+    return result;
+  }
+
+  try {
+    const textDetected = normalizeSpeechLanguageCode(await detectLanguageWithGoogle(result.text));
+    if (textDetected) {
+      return {
+        ...result,
+        detected_language: textDetected,
+      };
+    }
+  } catch {
+    // keep STT language
+  }
+
+  return result;
+}
+
+async function recognizeRotation(
+  buffer: Buffer,
+  mimeType: string,
+  fileName: string,
+  durationSeconds: number,
+  rotation: string[],
+): Promise<RecognizeResult | null> {
+  const primary = rotation[0];
+  const alternatives = rotation.slice(1, 4);
+  const encoding = speechEncoding(mimeType, fileName);
+  const payload = {
+    config: {
+      encoding,
+      languageCode: primary,
+      alternativeLanguageCodes: alternatives,
+      enableAutomaticPunctuation: true,
+      model: speechModel(durationSeconds, false),
+      ...(encoding === 'LINEAR16' ? {sampleRateHertz: 16000} : {}),
+    },
+    audio: {content: buffer.toString('base64')},
+  };
+
+  const response = await fetchWithRetry(
+    `https://speech.googleapis.com/v1/speech:recognize?key=${encodeURIComponent(GOOGLE_SPEECH_API_KEY)}`,
+    {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)},
+  );
+  const body = await response.text();
+  if (!response.ok) {
+    return null;
+  }
+
+  const data = JSON.parse(body) as {
+    results?: Array<{
+      alternatives?: Array<{transcript?: string; confidence?: number}>;
+      languageCode?: string;
+    }>;
+  };
+
+  const transcripts: string[] = [];
+  let detectedLanguage = primary;
+  let confidence = 0;
+  for (const result of data.results || []) {
+    const alt = result.alternatives?.[0];
+    const piece = alt?.transcript?.trim();
+    if (piece) {
+      transcripts.push(piece);
+    }
+    if (typeof alt?.confidence === 'number') {
+      confidence = Math.max(confidence, alt.confidence);
+    }
+    if (result.languageCode) {
+      detectedLanguage = result.languageCode;
+    }
+  }
+
+  const text = transcripts.join(' ').trim();
+  if (!text) {
+    return null;
+  }
+
+  return {
+    text,
+    detected_language: normalizeSpeechLanguageCode(detectedLanguage) || normalizeSpeechLanguageCode(primary),
+    confidence,
+  };
+}
+
 async function recognizeAutoMultiPass(
   buffer: Buffer,
   mimeType: string,
@@ -227,69 +320,30 @@ async function recognizeAutoMultiPass(
   const attempts: RecognizeResult[] = [];
 
   if ((languageCandidates || []).length > 0) {
-    const channelResult = await recognizeChunk(buffer, mimeType, fileName, '', durationSeconds, languageCandidates);
-    if (channelResult.text) {
-      attempts.push(channelResult);
+    try {
+      const channelResult = await recognizeChunk(buffer, mimeType, fileName, '', durationSeconds, languageCandidates);
+      if (channelResult.text) {
+        attempts.push(channelResult);
+      }
+    } catch {
+      // continue with rotations
     }
   }
 
   for (const rotation of AUTO_DETECT_ROTATIONS) {
-    const primary = rotation[0];
-    const alternatives = rotation.slice(1, 4);
-    const config = {languageCode: primary, alternativeLanguageCodes: alternatives};
-    const encoding = speechEncoding(mimeType, fileName);
-    const payload = {
-      config: {
-        encoding,
-        languageCode: config.languageCode,
-        alternativeLanguageCodes: config.alternativeLanguageCodes,
-        enableAutomaticPunctuation: true,
-        model: speechModel(durationSeconds, false),
-        ...(encoding === 'LINEAR16' ? {sampleRateHertz: 16000} : {}),
-      },
-      audio: {content: buffer.toString('base64')},
-    };
-
-    const response = await fetchWithRetry(
-      `https://speech.googleapis.com/v1/speech:recognize?key=${encodeURIComponent(GOOGLE_SPEECH_API_KEY)}`,
-      {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)},
-    );
-    const body = await response.text();
-    if (!response.ok) {
-      continue;
+    const result = await recognizeRotation(buffer, mimeType, fileName, durationSeconds, rotation);
+    if (result) {
+      attempts.push(result);
     }
+  }
 
-    const data = JSON.parse(body) as {
-      results?: Array<{
-        alternatives?: Array<{transcript?: string; confidence?: number}>;
-        languageCode?: string;
-      }>;
-    };
-
-    const transcripts: string[] = [];
-    let detectedLanguage = primary;
-    let confidence = 0;
-    for (const result of data.results || []) {
-      const alt = result.alternatives?.[0];
-      const piece = alt?.transcript?.trim();
-      if (piece) {
-        transcripts.push(piece);
+  if (attempts.length === 0) {
+    const sampled = await getSampledSpeechRotations(STT_FALLBACK_SAMPLE_BATCHES);
+    for (const rotation of sampled) {
+      const result = await recognizeRotation(buffer, mimeType, fileName, durationSeconds, rotation);
+      if (result) {
+        attempts.push(result);
       }
-      if (typeof alt?.confidence === 'number') {
-        confidence = Math.max(confidence, alt.confidence);
-      }
-      if (result.languageCode) {
-        detectedLanguage = result.languageCode;
-      }
-    }
-
-    const text = transcripts.join(' ').trim();
-    if (text) {
-      attempts.push({
-        text,
-        detected_language: normalizeSpeechLanguageCode(detectedLanguage) || normalizeSpeechLanguageCode(primary),
-        confidence,
-      });
     }
   }
 
@@ -298,7 +352,7 @@ async function recognizeAutoMultiPass(
   }
 
   attempts.sort((a, b) => scoreGoogleResult(b) - scoreGoogleResult(a));
-  return attempts[0];
+  return lockLanguageWithGoogleDetect(attempts[0]);
 }
 
 export async function transcribeWithGoogleSpeech(
@@ -310,10 +364,17 @@ export async function transcribeWithGoogleSpeech(
   pcmSamples?: Float32Array,
   languageCandidates?: string[],
 ): Promise<{text: string; detected_language: string; engine: string; confidence: number}> {
-  const duration = durationSeconds || 0;
+  const decodedDuration = pcmSamples && pcmSamples.length > 0 ? pcmSamples.length / 16000 : 0;
+  const duration = durationSeconds || decodedDuration || 0;
   const explicit = Boolean(toSpeechBcp47(languageHint));
 
-  if (duration > GOOGLE_SPEECH_SYNC_MAX_SECONDS && pcmSamples && pcmSamples.length > 0) {
+  const useWav = pcmSamples && pcmSamples.length > 0;
+  const audioBuffer = useWav ? float32ToWav(pcmSamples, 16000) : buffer;
+  const audioMime = useWav ? 'audio/wav' : mimeType;
+  const audioName = useWav ? 'recording.wav' : fileName;
+  const audioDuration = useWav ? pcmSamples.length / 16000 : duration;
+
+  if (audioDuration > GOOGLE_SPEECH_SYNC_MAX_SECONDS && pcmSamples && pcmSamples.length > 0) {
     const chunkSize = CHUNK_SECONDS * 16000;
     const parts: string[] = [];
     let detectedLanguage = '';
@@ -340,11 +401,17 @@ export async function transcribeWithGoogleSpeech(
       throw new Error('No speech detected in the recording.');
     }
 
-    return {
+    const locked = await lockLanguageWithGoogleDetect({
       text,
       detected_language: detectedLanguage,
-      engine: 'google-speech-chunked',
       confidence: chunkCount > 0 ? totalConfidence / chunkCount : 0,
+    });
+
+    return {
+      text: locked.text,
+      detected_language: locked.detected_language,
+      engine: 'google-speech-chunked',
+      confidence: locked.confidence,
     };
   }
 
@@ -355,17 +422,19 @@ export async function transcribeWithGoogleSpeech(
   }
 
   const result = explicit
-    ? await recognizeChunk(buffer, mimeType, fileName, languageHint, duration, languageCandidates)
-    : await recognizeAutoMultiPass(buffer, mimeType, fileName, duration, languageCandidates);
+    ? await recognizeChunk(audioBuffer, audioMime, audioName, languageHint, audioDuration, languageCandidates)
+    : await recognizeAutoMultiPass(audioBuffer, audioMime, audioName, audioDuration, languageCandidates);
 
   if (!result.text) {
     throw new Error('No speech detected in the recording.');
   }
 
+  const locked = await lockLanguageWithGoogleDetect(result);
+
   return {
-    text: result.text,
-    detected_language: result.detected_language,
+    text: locked.text,
+    detected_language: locked.detected_language,
     engine: explicit ? 'google-speech' : 'google-speech-auto',
-    confidence: result.confidence,
+    confidence: locked.confidence,
   };
 }

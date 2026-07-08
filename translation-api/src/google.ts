@@ -92,8 +92,22 @@ export async function translateWithGoogle(
   from: string,
   to: string,
 ): Promise<{translated: string; engine: string; detectedFrom?: string}> {
-  const payload: Record<string, string> = {
-    q: text,
+  const [result] = await translateBatchWithGoogle([text], from, to);
+  return result;
+}
+
+export async function translateBatchWithGoogle(
+  texts: string[],
+  from: string,
+  to: string,
+): Promise<Array<{translated: string; engine: string; detectedFrom?: string}>> {
+  const filtered = texts.map((text) => text ?? '');
+  if (filtered.length === 0) {
+    return [];
+  }
+
+  const payload: Record<string, unknown> = {
+    q: filtered,
     target: to,
     format: 'text',
   };
@@ -122,15 +136,20 @@ export async function translateWithGoogle(
     };
   };
 
-  const translation = data.data?.translations?.[0];
-  const translated = translation?.translatedText?.trim();
-  if (!translated) {
-    throw new Error('Google Translate returned an empty translation');
+  const translations = data.data?.translations || [];
+  if (translations.length !== filtered.length) {
+    throw new Error('Google Translate batch response size mismatch');
   }
 
-  return {
-    translated,
-    engine: 'google-translate',
-    detectedFrom: translation?.detectedSourceLanguage,
-  };
+  return translations.map((entry) => {
+    const translated = entry.translatedText?.trim();
+    if (!translated) {
+      throw new Error('Google Translate returned an empty translation');
+    }
+    return {
+      translated,
+      engine: 'google-translate',
+      detectedFrom: entry.detectedSourceLanguage,
+    };
+  });
 }

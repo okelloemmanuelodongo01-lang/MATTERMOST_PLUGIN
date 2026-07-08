@@ -47,7 +47,13 @@ export default function SpeakButton({postId, className = ''}: Props) {
         };
     }, [postId]);
 
-    const handleClick = useCallback(async () => {
+    const handleClick = useCallback(async (event: React.MouseEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if ('stopImmediatePropagation' in event.nativeEvent) {
+            event.nativeEvent.stopImmediatePropagation();
+        }
+
         setError(null);
 
         if (playing) {
@@ -82,7 +88,13 @@ export default function SpeakButton({postId, className = ''}: Props) {
                     (playing ? ' translation-speak-button--playing' : '') +
                     (loading ? ' translation-speak-button--loading' : '')
                 }
-                onClick={() => void handleClick()}
+                onClick={(event) => void handleClick(event)}
+                onPointerDown={(event) => {
+                    event.stopPropagation();
+                }}
+                onMouseDown={(event) => {
+                    event.stopPropagation();
+                }}
                 aria-label={label}
                 title={label}
                 disabled={loading}

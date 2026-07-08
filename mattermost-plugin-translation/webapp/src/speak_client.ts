@@ -1,7 +1,14 @@
+import type {Store} from 'redux';
+import type {GlobalState} from '@mattermost/types/store';
+import type {Post} from '@mattermost/types/posts';
+
 import {languageCodeLabel} from './language_labels';
+import {getPluginState, getMyReceiveLanguage, isTranslationRecordCurrent, type ReadAloudMode} from './reducer';
 
 const PLUGIN_ID = 'com.transchecker.translation';
 const API_BASE = `/plugins/${PLUGIN_ID}/api/v1`;
+
+let speakStoreRef: Store<GlobalState> | null = null;
 
 let activeAudio: HTMLAudioElement | null = null;
 let activeObjectUrl: string | null = null;
@@ -10,6 +17,10 @@ let usingBrowserSpeech = false;
 
 const postAudioCache = new Map<string, Blob>();
 const POST_AUDIO_CACHE_MAX = 50;
+
+function speakCacheKey(postId: string, voiceGender: string, readMode: string): string {
+    return `${postId}:${voiceGender}:${readMode}`;
+}
 
 type SpeechListener = (postId: string | null) => void;
 const listeners = new Set<SpeechListener>();
@@ -45,11 +56,11 @@ export function clearSpeakAudioCache(): void {
     postAudioCache.clear();
 }
 
-function cachePostAudio(postId: string, blob: Blob): void {
-    if (postAudioCache.has(postId)) {
-        postAudioCache.delete(postId);
+function cachePostAudio(cacheKey: string, blob: Blob): void {
+    if (postAudioCache.has(cacheKey)) {
+        postAudioCache.delete(cacheKey);
     }
-    postAudioCache.set(postId, blob);
+    postAudioCache.set(cacheKey, blob);
     while (postAudioCache.size > POST_AUDIO_CACHE_MAX) {
         const oldest = postAudioCache.keys().next().value;
         if (!oldest) {
@@ -196,27 +207,127 @@ type SpeakResolve = {
     read_aloud_mode?: string;
 };
 
-async function fetchSpeakResolve(postId: string): Promise<SpeakResolve> {
-    const response = await fetch(`${API_BASE}/speak/resolve`, {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {
-            'Content-Type': 'application/json',
-            'X-Requested-With': 'XMLHttpRequest',
-        },
-        body: JSON.stringify({post_id: postId}),
-    });
+export function bindSpeakStore(store: Store<GlobalState>) {
+    speakStoreRef = store;
+}
 
-    if (!response.ok) {
-        const text = await response.text();
-        throw new Error(text || `Could not prepare speech (${response.status})`);
+function getClientSpeakPayload(postId: string): SpeakResolve | null {
+    if (!speakStoreRef || !postId) {
+        return null;
     }
 
-    return response.json() as Promise<SpeakResolve>;
+    const state = speakStoreRef.getState();
+    const currentUserId = state.entities?.users?.currentUserId || '';
+    const post = state.entities?.posts?.posts?.[postId] as Post | undefined;
+    if (!post?.id) {
+        return null;
+    }
+
+    const pluginState = getPluginState(state as Record<string, unknown>);
+    const readMode: ReadAloudMode = pluginState.readAloudMode;
+    const targetLanguage = getMyReceiveLanguage(pluginState, currentUserId);
+    const voiceGender = pluginState.ttsVoiceGender;
+    const record = pluginState.byPostId[postId];
+    const message = post.message?.trim() || '';
+    const hasCurrentTranslation = Boolean(
+        record?.translated?.trim() &&
+        isTranslationRecordCurrent(record, targetLanguage) &&
+        !record.sameLanguage,
+    );
+
+    if (!message) {
+        return null;
+    }
+
+    if (currentUserId && post.user_id === currentUserId) {
+        return {
+            text: message,
+            language: record?.detectedFrom || targetLanguage,
+            voice_gender: voiceGender,
+            read_aloud_mode: readMode,
+        };
+    }
+
+    if (readMode === 'receive' && hasCurrentTranslation) {
+        return {
+            text: record!.translated,
+            language: record!.to || targetLanguage,
+            voice_gender: voiceGender,
+            read_aloud_mode: readMode,
+        };
+    }
+
+    return {
+        text: message,
+        language: record?.detectedFrom || targetLanguage,
+        voice_gender: voiceGender,
+        read_aloud_mode: readMode,
+    };
+}
+
+async function fetchSpeakResolveWithTimeout(postId: string, clientPayload?: SpeakResolve | null, timeoutMs = 12000): Promise<SpeakResolve> {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+        const response = await fetch(`${API_BASE}/speak/resolve`, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+            },
+            body: JSON.stringify({
+                post_id: postId,
+                voice_gender: clientPayload?.voice_gender,
+                read_aloud_mode: clientPayload?.read_aloud_mode,
+            }),
+            signal: controller.signal,
+        });
+
+        if (!response.ok) {
+            const text = await response.text();
+            throw new Error(text || `Could not prepare speech (${response.status})`);
+        }
+
+        const server = await response.json() as SpeakResolve;
+        if (!clientPayload) {
+            return server;
+        }
+
+        return {
+            text: clientPayload.text || server.text,
+            language: clientPayload.language || server.language,
+            voice_gender: clientPayload.voice_gender || server.voice_gender,
+            read_aloud_mode: clientPayload.read_aloud_mode || server.read_aloud_mode,
+        };
+    } finally {
+        window.clearTimeout(timer);
+    }
+}
+
+async function resolveSpeakPayload(postId: string): Promise<SpeakResolve> {
+    const clientPayload = getClientSpeakPayload(postId);
+    try {
+        return await fetchSpeakResolveWithTimeout(postId, clientPayload);
+    } catch {
+        if (clientPayload?.text) {
+            return clientPayload;
+        }
+        throw new Error('Could not prepare speech for this message.');
+    }
 }
 
 export async function fetchSpeakPreview(postId: string): Promise<{language: string; languageLabel: string}> {
-    const resolved = await fetchSpeakResolve(postId);
+    const clientPayload = getClientSpeakPayload(postId);
+    if (clientPayload?.language) {
+        return {
+            language: clientPayload.language,
+            languageLabel: languageCodeLabel(clientPayload.language),
+        };
+    }
+
+    const resolved = await resolveSpeakPayload(postId);
     const language = resolved.language || 'en';
     return {
         language,
@@ -252,8 +363,8 @@ async function playWithBrowserSpeech(postId: string, text: string, language: str
     return 'started';
 }
 
-async function playWithGoogleAudio(postId: string, blob: Blob): Promise<'started'> {
-    cachePostAudio(postId, blob);
+async function playWithGoogleAudio(postId: string, cacheKey: string, blob: Blob): Promise<'started'> {
+    cachePostAudio(cacheKey, blob);
     activeObjectUrl = URL.createObjectURL(blob);
     activePostId = postId;
     activeAudio = new Audio(activeObjectUrl);
@@ -277,39 +388,58 @@ export async function playPostSpeech(postId: string): Promise<'started' | 'stopp
 
     stopActiveSpeech();
 
-    const cached = postAudioCache.get(postId);
+    const clientPayload = getClientSpeakPayload(postId);
+    const voiceGender = clientPayload?.voice_gender || 'neutral';
+    const readMode = clientPayload?.read_aloud_mode || 'receive';
+    const cacheKey = speakCacheKey(postId, voiceGender, readMode);
+
+    const cached = postAudioCache.get(cacheKey);
     if (cached && cached.size > 0) {
-        return playWithGoogleAudio(postId, cached);
+        return playWithGoogleAudio(postId, cacheKey, cached);
     }
 
-    const response = await fetch(`${API_BASE}/speak`, {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {
-            'Content-Type': 'application/json',
-            'X-Requested-With': 'XMLHttpRequest',
-        },
-        body: JSON.stringify({post_id: postId}),
-    });
-
-    if (response.ok) {
-        const blob = await response.blob();
-        if (blob.size > 0) {
-            return playWithGoogleAudio(postId, blob);
-        }
-    }
-
-    const errorText = await response.text();
-    const resolved = await fetchSpeakResolve(postId);
+    const resolved = clientPayload || await resolveSpeakPayload(postId);
     const text = resolved.text?.trim();
     if (!text) {
         throw new Error('No text available to read aloud.');
     }
 
     const language = resolved.language || 'en';
+    const requestVoice = resolved.voice_gender || voiceGender;
+    const requestReadMode = resolved.read_aloud_mode || readMode;
+
     try {
-        return await playWithBrowserSpeech(postId, text, language, resolved.voice_gender);
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), 15000);
+        let response: Response;
+        try {
+            response = await fetch(`${API_BASE}/speak`, {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest',
+                },
+                body: JSON.stringify({
+                    post_id: postId,
+                    voice_gender: requestVoice,
+                    read_aloud_mode: requestReadMode,
+                }),
+                signal: controller.signal,
+            });
+        } finally {
+            window.clearTimeout(timer);
+        }
+
+        if (response.ok) {
+            const blob = await response.blob();
+            if (blob.size > 0) {
+                return playWithGoogleAudio(postId, cacheKey, blob);
+            }
+        }
     } catch {
-        throw new Error(parseSpeakError(errorText));
+        // Fall through to browser speech below.
     }
+
+    return playWithBrowserSpeech(postId, text, language, requestVoice);
 }

@@ -228,6 +228,8 @@ export function recordFromPayload(data: Record<string, string | number | boolean
 
         loading: false,
 
+        languageUncertain: Boolean(data.language_uncertain),
+
     };
 
 }

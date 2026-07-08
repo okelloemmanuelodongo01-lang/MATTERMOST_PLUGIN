@@ -2,10 +2,12 @@ import {
   detectLanguageWithGoogle,
   isGoogleTranslateEnabled,
   listGoogleLanguages,
+  translateBatchWithGoogle,
   translateWithGoogle,
   type LanguageOption,
 } from './google.js';
 import {expandChatSlang} from './chat_slang.js';
+import {normalizeCommandPhrases} from './command_phrases.js';
 import {levenshteinScore} from './levenshtein.js';
 import {
   compositeQualityScore,
@@ -13,6 +15,14 @@ import {
   isSemanticEmbeddingEnabled,
 } from './semantic_embeddings.js';
 import {detectLanguage as detectLanguageMyMemory, translateWithMyMemory} from './mymemory.js';
+import {
+  hasMarkdownMarkup,
+  markupStructurePreserved,
+  repairTranslatedMarkup,
+  stripMarkdownForScoring,
+  translatePreservingMarkup,
+  translatePreservingMarkupBatch,
+} from './markdown_translate.js';
 
 export type TranslateRequest = {
   text: string;
@@ -21,6 +31,22 @@ export type TranslateRequest = {
   hint_language?: string;
   /** Fast path for voice/video: one Google translate call, no back-translation or embeddings. */
   fast?: boolean;
+  /** deliver = forward only; evaluate = quality from existing translation; full = both (default). */
+  phase?: 'deliver' | 'evaluate' | 'full';
+  /** Required for phase=evaluate */
+  origin?: string;
+  translated?: string;
+  detected_from?: string;
+  engine?: string;
+};
+
+export type EvaluateRequest = {
+  origin: string;
+  translated: string;
+  to: string;
+  from?: string;
+  detected_from?: string;
+  engine?: string;
 };
 
 export type TranslateResponse = {
@@ -77,6 +103,56 @@ async function translateForward(
     return translateWithGoogle(text, from, to);
   }
   return translateWithMyMemory(text, from, to);
+}
+
+async function translateForwardPreservingMarkup(
+  text: string,
+  from: string,
+  to: string,
+): Promise<{translated: string; engine: string; detectedFrom?: string}> {
+  if (!hasMarkdownMarkup(text)) {
+    return translateForward(text, from, to);
+  }
+
+  // Google-first: one API call for the full message (same strategy as translate.google.com).
+  // Google v2 truncates around 5k chars per q — use markup batch for longer posts.
+  if (isGoogleTranslateEnabled() && text.length <= 4800) {
+    const whole = await translateForward(text, from, to);
+    const repaired = repairTranslatedMarkup(whole.translated);
+    if (markupStructurePreserved(text, repaired)) {
+      return {
+        translated: repaired,
+        engine: `${whole.engine}:whole`,
+        detectedFrom: whole.detectedFrom,
+      };
+    }
+  }
+
+  let engine = getTranslationEngine();
+  let detectedFrom = from;
+
+  if (isGoogleTranslateEnabled()) {
+    const translated = await translatePreservingMarkupBatch(text, async (chunks) => {
+      const results = await translateBatchWithGoogle(chunks, from, to);
+      engine = results[0]?.engine || engine;
+      if (!detectedFrom && results[0]?.detectedFrom) {
+        detectedFrom = results[0].detectedFrom;
+      }
+      return results.map((entry) => entry.translated);
+    });
+    return {translated, engine: `${engine}:markup-batch`, detectedFrom};
+  }
+
+  const translated = await translatePreservingMarkup(text, async (segment) => {
+    const result = await translateForward(segment, from, to);
+    engine = result.engine;
+    if (result.detectedFrom) {
+      detectedFrom = result.detectedFrom;
+    }
+    return result.translated;
+  });
+
+  return {translated, engine: `${engine}:markup`, detectedFrom};
 }
 
 function simpleSemanticScore(original: string, backTranslated: string): number {
@@ -139,11 +215,13 @@ async function scoreTranslation(
     };
   }
 
-  const backward = await translateForward(translated, to, from);
-  const score = levenshteinScore(scoreOrigin, backward.translated);
-  const semantic_score = simpleSemanticScore(scoreOrigin, backward.translated);
+  const plainOrigin = stripMarkdownForScoring(scoreOrigin);
+  const plainTranslated = stripMarkdownForScoring(translated);
+  const backward = await translateForward(plainTranslated || translated, to, from);
+  const score = levenshteinScore(plainOrigin || scoreOrigin, backward.translated);
+  const semantic_score = simpleSemanticScore(plainOrigin || scoreOrigin, backward.translated);
   const embedding_score = isSemanticEmbeddingEnabled()
-    ? await embeddingSimilarity(scoreOrigin, backward.translated)
+    ? await embeddingSimilarity(plainOrigin || scoreOrigin, backward.translated)
     : 0;
   const quality_score = compositeQualityScore(score, semantic_score, embedding_score);
 
@@ -166,7 +244,9 @@ async function buildCandidate(
   to: string,
   from: string,
 ): Promise<ScoredCandidate> {
-  const forward = await translateForward(sourceText, from, to);
+  const forward = hasMarkdownMarkup(sourceText)
+    ? await translateForwardPreservingMarkup(sourceText, from, to)
+    : await translateForward(sourceText, from, to);
   const detectedFrom = forward.detectedFrom || from || await detectLanguage(sourceText);
   const resolvedFrom = from || detectedFrom;
 
@@ -200,22 +280,122 @@ async function pickBestCandidate(candidates: ScoredCandidate[]): Promise<ScoredC
   ));
 }
 
-async function translateTextFast(req: TranslateRequest): Promise<TranslateResponse> {
+/** Forward translation only — for instant message delivery. */
+export async function deliverText(req: TranslateRequest, rawOrigin?: string): Promise<TranslateResponse> {
   const text = req.text?.trim();
   if (!text) {
     throw new Error('text is required');
   }
+  const origin = rawOrigin?.trim() || req.origin?.trim() || text;
+  const to = req.to;
+  let from = req.from?.trim() || '';
+
+  if (!from) {
+    const detectionText = hasMarkdownMarkup(text) ? stripMarkdownForScoring(text) : text;
+    from = await detectLanguage(detectionText || text);
+  }
+
+  if (isSameLanguage(from, to)) {
+    return {
+      origin,
+      to,
+      from,
+      detected_from: from,
+      translated: text,
+      engine: 'none',
+      reversed: '',
+      score: 0,
+      semantic_score: 0,
+      embedding_score: 0,
+      quality_score: 0,
+    };
+  }
+
+  const forward = hasMarkdownMarkup(text)
+    ? await translateForwardPreservingMarkup(text, from, to)
+    : await translateForward(text, from, to);
+  const detectedFrom = forward.detectedFrom || from;
+
+  return {
+    origin,
+    to,
+    from: detectedFrom,
+    detected_from: detectedFrom,
+    translated: forward.translated,
+    engine: `${forward.engine}:deliver`,
+    reversed: '',
+    score: 0,
+    semantic_score: 0,
+    embedding_score: 0,
+    quality_score: 0,
+  };
+}
+
+/** Quality evaluation from an existing forward translation. */
+export async function evaluateText(req: EvaluateRequest): Promise<TranslateResponse> {
+  const origin = req.origin?.trim();
+  const translated = req.translated?.trim();
+  if (!origin || !translated) {
+    throw new Error('origin and translated are required');
+  }
+  if (!req.to) {
+    throw new Error('to is required');
+  }
+
+  const to = req.to;
+  const from = req.from?.trim() || req.detected_from?.trim() || '';
+  const detectedFrom = req.detected_from?.trim() || from;
+  const engine = req.engine?.trim() || getTranslationEngine();
+
+  if (!from && !detectedFrom) {
+    const detectionText = hasMarkdownMarkup(origin) ? stripMarkdownForScoring(origin) : origin;
+    const detected = await detectLanguage(detectionText || origin);
+    return evaluateText({...req, from: detected, detected_from: detected});
+  }
+
+  const resolvedFrom = from || detectedFrom;
+  const scored = await scoreTranslation(
+    origin,
+    to,
+    resolvedFrom,
+    detectedFrom || resolvedFrom,
+    translated,
+    engine,
+  );
+
+  return {
+    origin,
+    to,
+    from: scored.from,
+    detected_from: scored.detectedFrom,
+    translated: scored.translated,
+    engine: `${scored.engine}:evaluate`,
+    reversed: scored.reversed,
+    score: scored.score,
+    semantic_score: scored.semantic_score,
+    embedding_score: scored.embedding_score,
+    quality_score: scored.quality_score,
+  };
+}
+
+async function translateTextFast(req: TranslateRequest, rawOrigin?: string): Promise<TranslateResponse> {
+  const text = req.text?.trim();
+  if (!text) {
+    throw new Error('text is required');
+  }
+  const origin = rawOrigin?.trim() || text;
 
   const to = req.to;
   let from = req.from?.trim() || '';
 
   if (!from) {
-    from = await detectLanguage(text);
+    const detectionText = hasMarkdownMarkup(text) ? stripMarkdownForScoring(text) : text;
+    from = await detectLanguage(detectionText || text);
   }
 
   if (isSameLanguage(from, to)) {
     return {
-      origin: text,
+      origin,
       to,
       from,
       detected_from: from,
@@ -229,35 +409,81 @@ async function translateTextFast(req: TranslateRequest): Promise<TranslateRespon
     };
   }
 
-  const forward = await translateForward(text, from, to);
+  const forward = hasMarkdownMarkup(text)
+    ? await translateForwardPreservingMarkup(text, from, to)
+    : await translateForward(text, from, to);
   const detectedFrom = forward.detectedFrom || from;
 
+  // Media path: STT already detected source — skip back-translation round-trip.
+  if (req.from?.trim()) {
+    return {
+      origin,
+      to,
+      from: detectedFrom,
+      detected_from: detectedFrom,
+      translated: forward.translated,
+      engine: `${forward.engine}:fast`,
+      reversed: forward.translated,
+      score: 1,
+      semantic_score: 1,
+      embedding_score: 0,
+      quality_score: 1,
+    };
+  }
+
+  const plainOrigin = stripMarkdownForScoring(origin);
+  const plainTranslated = stripMarkdownForScoring(forward.translated);
+  const backward = await translateForward(plainTranslated || forward.translated, to, detectedFrom);
+  const score = levenshteinScore(plainOrigin || origin, backward.translated);
+
   return {
-    origin: text,
+    origin,
     to,
     from: detectedFrom,
     detected_from: detectedFrom,
     translated: forward.translated,
     engine: `${forward.engine}:fast`,
-    reversed: forward.translated,
-    score: 1,
-    semantic_score: 1,
+    reversed: backward.translated,
+    score: Math.round(score * 100) / 100,
+    semantic_score: Math.round(score * 100) / 100,
     embedding_score: 0,
-    quality_score: 1,
+    quality_score: Math.round(score * 100) / 100,
   };
 }
 
 export async function translateText(req: TranslateRequest): Promise<TranslateResponse> {
-  const text = req.text?.trim();
-  if (!text) {
+  const rawText = req.text?.trim();
+  if (!rawText) {
     throw new Error('text is required');
   }
   if (!req.to) {
     throw new Error('to is required');
   }
 
+  const text = normalizeCommandPhrases(rawText);
+
+  if (req.phase === 'deliver') {
+    return deliverText({...req, text}, rawText);
+  }
+
+  if (req.phase === 'evaluate') {
+    const origin = req.origin?.trim() || rawText;
+    const translated = req.translated?.trim();
+    if (!translated) {
+      throw new Error('translated is required for evaluate phase');
+    }
+    return evaluateText({
+      origin,
+      translated,
+      to: req.to,
+      from: req.from,
+      detected_from: req.detected_from,
+      engine: req.engine,
+    });
+  }
+
   if (req.fast) {
-    return translateTextFast(req);
+    return translateTextFast({...req, text}, rawText);
   }
 
   const to = req.to;
@@ -268,15 +494,18 @@ export async function translateText(req: TranslateRequest): Promise<TranslateRes
   const workingText = slang.text;
 
   if (!from) {
-    const detectedFrom = await detectLanguage(workingText);
+    const detectionText = hasMarkdownMarkup(workingText)
+      ? stripMarkdownForScoring(workingText)
+      : workingText;
+    const detectedFrom = await detectLanguage(detectionText || workingText);
 
     if (isSameLanguage(detectedFrom, to)) {
       return {
-        origin: text,
+        origin: rawText,
         to,
         from: detectedFrom,
         detected_from: detectedFrom,
-        translated: text,
+        translated: rawText,
         engine: 'none',
         reversed: text,
         score: 1,
@@ -291,21 +520,21 @@ export async function translateText(req: TranslateRequest): Promise<TranslateRes
     const candidates: ScoredCandidate[] = [];
 
     if (slang.expanded) {
-      candidates.push(await buildCandidate(text, workingText, to, ''));
+      candidates.push(await buildCandidate(rawText, workingText, to, ''));
       if (slang.slangLanguage) {
-        candidates.push(await buildCandidate(text, workingText, to, slang.slangLanguage));
+        candidates.push(await buildCandidate(rawText, workingText, to, slang.slangLanguage));
       }
     } else {
-      candidates.push(await buildCandidate(text, text, to, ''));
+      candidates.push(await buildCandidate(rawText, text, to, ''));
     }
 
     if (text.length <= SHORT_TEXT_MAX && hintLanguage && !isSameLanguage(hintLanguage, detectedFrom)) {
-      candidates.push(await buildCandidate(text, workingText, to, hintLanguage));
+      candidates.push(await buildCandidate(rawText, workingText, to, hintLanguage));
     }
 
     const best = await pickBestCandidate(candidates);
     return {
-      origin: text,
+      origin: rawText,
       to,
       from: best.from,
       detected_from: best.detectedFrom,
@@ -323,13 +552,13 @@ export async function translateText(req: TranslateRequest): Promise<TranslateRes
 
   if (isSameLanguage(from, to)) {
     return {
-      origin: text,
+      origin: rawText,
       to,
       from,
       detected_from: from,
-      translated: text,
+      translated: rawText,
       engine: 'none',
-      reversed: text,
+      reversed: rawText,
       score: 1,
       semantic_score: 1,
       embedding_score: 1,
@@ -340,14 +569,14 @@ export async function translateText(req: TranslateRequest): Promise<TranslateRes
   }
 
   const best = await buildCandidate(
-    text,
+    rawText,
     slang.expanded ? workingText : text,
     to,
     from,
   );
 
   return {
-    origin: text,
+    origin: rawText,
     to,
     from: best.from,
     detected_from: best.detectedFrom,

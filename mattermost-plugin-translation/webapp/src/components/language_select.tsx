@@ -1,5 +1,6 @@
 import React, {useEffect, useState} from 'react';
 
+import PreferenceSelect from './preference_select';
 import {fetchLanguageOptions, type LanguageOption} from '../language_options';
 
 type Props = {
@@ -37,20 +38,13 @@ export default function LanguageSelect({value, onChange, className, disabled}: P
     }
 
     return (
-        <select
+        <PreferenceSelect
             className={className || 'translation-language-select'}
             value={value}
+            options={options}
             disabled={disabled}
-            onChange={(event) => onChange(event.target.value)}
-        >
-            {options.map((option) => (
-                <option
-                    key={option.value}
-                    value={option.value}
-                >
-                    {option.label}
-                </option>
-            ))}
-        </select>
+            aria-label='Your receive language'
+            onChange={onChange}
+        />
     );
 }

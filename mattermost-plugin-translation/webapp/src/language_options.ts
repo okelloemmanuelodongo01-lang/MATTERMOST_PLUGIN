@@ -14,6 +14,14 @@ export const FALLBACK_LANGUAGE_OPTIONS: LanguageOption[] = [
 
 let cachedLanguageOptions: LanguageOption[] | null = null;
 
+export function getLanguageLabel(code: string): string {
+    const normalized = code.trim().toLowerCase().split(/[-_]/)[0];
+    const match = (cachedLanguageOptions || FALLBACK_LANGUAGE_OPTIONS).find(
+        (option) => option.value.toLowerCase() === normalized,
+    );
+    return match?.label || code.toUpperCase();
+}
+
 export async function fetchLanguageOptions(): Promise<LanguageOption[]> {
     if (cachedLanguageOptions) {
         return cachedLanguageOptions;

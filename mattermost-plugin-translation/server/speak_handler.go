@@ -16,7 +16,9 @@ import (
 )
 
 type speakAPIRequest struct {
-	PostID string `json:"post_id"`
+	PostID        string `json:"post_id"`
+	VoiceGender   string `json:"voice_gender"`
+	ReadAloudMode string `json:"read_aloud_mode"`
 }
 
 type cachedSpeakAudio struct {
@@ -69,13 +71,16 @@ func (p *Plugin) storeCachedSpeakAudio(key string, audio []byte) {
 	}
 }
 
-func (p *Plugin) resolveSpeakableTextForUser(post *model.Post, userID string) (string, string, error) {
+func (p *Plugin) resolveSpeakableTextForUser(post *model.Post, userID, readModeOverride string) (string, string, error) {
 	if post == nil {
 		return "", "", fmt.Errorf("post not found")
 	}
 
 	targetLang := p.getUserTargetLanguage(userID)
-	readMode := p.getUserReadAloudMode(userID)
+	readMode := strings.TrimSpace(readModeOverride)
+	if readMode == "" {
+		readMode = p.getUserReadAloudMode(userID)
+	}
 
 	if post.UserId == userID {
 		if isMediaNotePost(post) {
@@ -246,18 +251,28 @@ func (p *Plugin) handleSpeakResolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	text, language, err := p.resolveSpeakableTextForUser(post, userID)
+	text, language, err := p.resolveSpeakableTextForUser(post, userID, req.ReadAloudMode)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	voiceGender := strings.TrimSpace(req.VoiceGender)
+	if voiceGender == "" {
+		voiceGender = p.getUserTTSVoiceGender(userID)
+	}
+
+	readMode := strings.TrimSpace(req.ReadAloudMode)
+	if readMode == "" {
+		readMode = p.getUserReadAloudMode(userID)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"text":             text,
 		"language":         language,
-		"voice_gender":     p.getUserTTSVoiceGender(userID),
-		"read_aloud_mode":  p.getUserReadAloudMode(userID),
+		"voice_gender":     voiceGender,
+		"read_aloud_mode":  readMode,
 	})
 }
 
@@ -282,13 +297,16 @@ func (p *Plugin) handleSpeak(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	text, language, err := p.resolveSpeakableTextForUser(post, userID)
+	text, language, err := p.resolveSpeakableTextForUser(post, userID, req.ReadAloudMode)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	voiceGender := p.getUserTTSVoiceGender(userID)
+	voiceGender := strings.TrimSpace(req.VoiceGender)
+	if voiceGender == "" {
+		voiceGender = p.getUserTTSVoiceGender(userID)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 

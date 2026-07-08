@@ -6,10 +6,11 @@ import {detectLanguageWithGoogle, isGoogleTranslateEnabled} from './google.js';
 import {detectLanguage as detectLanguageMyMemory} from './mymemory.js';
 import {getSpeechEngine, transcribeAudioBuffer} from './transcribe.js';
 import {isGoogleSpeechEnabled} from './google_speech.js';
+import {preloadSpeechLanguageCatalog} from './speech_language_catalog.js';
 import {getCachedAudioEntryCount, getCachedGoogleVoiceCount, isGoogleTTSEnabled, listSupportedTTSLanguageBases, loadGoogleVoices, synthesizeSpeech} from './google_tts.js';
 import {getUsage, QuotaExceededError, trackUsage} from './usage.js';
 import {getSemanticModelName, isSemanticEmbeddingEnabled} from './semantic_embeddings.js';
-import {getTranslationEngine, listLanguages, translateText} from './translate.js';
+import {deliverText, evaluateText, getTranslationEngine, listLanguages, translateText} from './translate.js';
 
 const PORT = Number(process.env.PORT) || 5000;
 const API_KEY = process.env.API_KEY || 'dev-transchecker-key-change-in-production';
@@ -95,23 +96,53 @@ app.post('/detect', requireApiKey, async (req, res) => {
 
 app.post('/translate', requireApiKey, async (req, res) => {
   try {
-    const {text, to, from, hint_language, fast} = req.body as {
+    const {text, to, from, hint_language, fast, phase, origin, translated, detected_from, engine} = req.body as {
       text?: string;
       to?: string;
       from?: string;
       hint_language?: string;
       fast?: boolean;
+      phase?: 'deliver' | 'evaluate' | 'full';
+      origin?: string;
+      translated?: string;
+      detected_from?: string;
+      engine?: string;
     };
-    if (!text || !to) {
-      res.status(400).json({error: 'text and to are required'});
+    if (!to) {
+      res.status(400).json({error: 'to is required'});
+      return;
+    }
+    if (phase === 'evaluate') {
+      if (!origin || !translated) {
+        res.status(400).json({error: 'origin and translated are required for evaluate phase'});
+        return;
+      }
+      const apiKey = (req as express.Request & {apiKey: string}).apiKey;
+      trackUsage(apiKey, origin.length + translated.length, MONTHLY_CHAR_LIMIT);
+      const result = await evaluateText({origin, translated, to, from, detected_from, engine});
+      trackUsage(apiKey, result.reversed.length, MONTHLY_CHAR_LIMIT);
+      res.json(result);
+      return;
+    }
+    if (!text) {
+      res.status(400).json({error: 'text is required'});
       return;
     }
 
     const apiKey = (req as express.Request & {apiKey: string}).apiKey;
     trackUsage(apiKey, text.length, MONTHLY_CHAR_LIMIT);
 
-    const result = await translateText({text, to, from, hint_language, fast: Boolean(fast)});
-    trackUsage(apiKey, result.translated.length, MONTHLY_CHAR_LIMIT);
+    const result = await translateText({
+      text,
+      to,
+      from,
+      hint_language,
+      fast: Boolean(fast),
+      phase: phase || (fast ? undefined : undefined),
+    });
+    if (result.translated) {
+      trackUsage(apiKey, result.translated.length, MONTHLY_CHAR_LIMIT);
+    }
 
     res.json(result);
   } catch (err) {
@@ -129,6 +160,72 @@ app.post('/translate', requireApiKey, async (req, res) => {
       return;
     }
 
+    res.status(502).json({error: message});
+  }
+});
+
+app.post('/translate/deliver', requireApiKey, async (req, res) => {
+  try {
+    const {text, to, from, hint_language} = req.body as {
+      text?: string;
+      to?: string;
+      from?: string;
+      hint_language?: string;
+    };
+    if (!text || !to) {
+      res.status(400).json({error: 'text and to are required'});
+      return;
+    }
+
+    const apiKey = (req as express.Request & {apiKey: string}).apiKey;
+    trackUsage(apiKey, text.length, MONTHLY_CHAR_LIMIT);
+
+    const result = await deliverText({text, to, from, hint_language});
+    trackUsage(apiKey, result.translated.length, MONTHLY_CHAR_LIMIT);
+    res.json(result);
+  } catch (err) {
+    if (err instanceof QuotaExceededError) {
+      res.status(429).json({
+        error: 'Monthly character quota exceeded',
+        ...getUsage((req as express.Request & {apiKey: string}).apiKey, MONTHLY_CHAR_LIMIT),
+      });
+      return;
+    }
+    const message = err instanceof Error ? err.message : 'Deliver failed';
+    res.status(502).json({error: message});
+  }
+});
+
+app.post('/translate/evaluate', requireApiKey, async (req, res) => {
+  try {
+    const {origin, translated, to, from, detected_from, engine} = req.body as {
+      origin?: string;
+      translated?: string;
+      to?: string;
+      from?: string;
+      detected_from?: string;
+      engine?: string;
+    };
+    if (!origin || !translated || !to) {
+      res.status(400).json({error: 'origin, translated, and to are required'});
+      return;
+    }
+
+    const apiKey = (req as express.Request & {apiKey: string}).apiKey;
+    trackUsage(apiKey, origin.length + translated.length, MONTHLY_CHAR_LIMIT);
+
+    const result = await evaluateText({origin, translated, to, from, detected_from, engine});
+    trackUsage(apiKey, result.reversed.length, MONTHLY_CHAR_LIMIT);
+    res.json(result);
+  } catch (err) {
+    if (err instanceof QuotaExceededError) {
+      res.status(429).json({
+        error: 'Monthly character quota exceeded',
+        ...getUsage((req as express.Request & {apiKey: string}).apiKey, MONTHLY_CHAR_LIMIT),
+      });
+      return;
+    }
+    const message = err instanceof Error ? err.message : 'Evaluation failed';
     res.status(502).json({error: message});
   }
 });
@@ -195,8 +292,18 @@ app.listen(PORT, () => {
   console.log(`  Health:     http://localhost:${PORT}/health`);
   console.log(`  Languages:  GET  http://localhost:${PORT}/languages`);
   console.log(`  Translate:  POST http://localhost:${PORT}/translate`);
+  console.log(`  Deliver:    POST http://localhost:${PORT}/translate/deliver`);
+  console.log(`  Evaluate:   POST http://localhost:${PORT}/translate/evaluate`);
   console.log(`  Transcribe: POST http://localhost:${PORT}/transcribe`);
   console.log(`  Synthesize: POST http://localhost:${PORT}/synthesize`);
+
+  if (isGoogleSpeechEnabled()) {
+    void preloadSpeechLanguageCatalog().then((batchCount) => {
+      console.log(`  STT batches: ${batchCount} rotation groups (full Google language list)`);
+    }).catch((err) => {
+      console.warn('  STT language catalog preload skipped —', err instanceof Error ? err.message : err);
+    });
+  }
 
   if (isGoogleTTSEnabled()) {
     void loadGoogleVoices().then((voices) => {

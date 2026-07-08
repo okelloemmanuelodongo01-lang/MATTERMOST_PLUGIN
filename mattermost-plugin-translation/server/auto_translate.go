@@ -30,7 +30,7 @@ func (p *Plugin) MessageHasBeenPosted(_ *plugin.Context, post *model.Post) {
 	}
 
 	if isVoiceNotePost(post) || isVideoNotePost(post) {
-		go p.processMediaPost(post)
+		// Voice/video: transcribe + translate only when the reader clicks "Translate to text".
 		return
 	}
 
@@ -74,6 +74,7 @@ func (p *Plugin) autoTranslatePostTextWithHint(post *model.Post, text string, hi
 		langToUsers[lang] = append(langToUsers[lang], userID)
 	}
 
+	resultsByLang := make(map[string]langTranslation)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -90,7 +91,7 @@ func (p *Plugin) autoTranslatePostTextWithHint(post *model.Post, text string, hi
 				hint = p.getUserTargetLanguage(post.UserId)
 			}
 
-			result, cached, err := p.translateWithCache(text, "", to, hint)
+			deliver, cached, err := p.translateDeliverWithCache(text, "", to, hint)
 			if err != nil {
 				for _, userID := range recipients {
 					p.API.PublishWebSocketEvent("translation_error", map[string]interface{}{
@@ -103,17 +104,58 @@ func (p *Plugin) autoTranslatePostTextWithHint(post *model.Post, text string, hi
 				return
 			}
 
-			sameLanguage := isSameLanguage(result.DetectedFrom, to)
+			sameLanguage := isSameLanguage(deliver.DetectedFrom, to)
 
 			mu.Lock()
+			resultsByLang[to] = langTranslation{result: deliver, cached: cached, sameLanguage: sameLanguage}
 			for _, userID := range recipients {
-				p.publishTranslationResult(userID, post.Id, result, cached, sameLanguage, true)
+				p.publishTranslationDelivered(userID, post.Id, deliver, cached, sameLanguage, true, false)
+				if deliver.HasEvaluation() {
+					p.publishTranslationEvaluated(userID, post.Id, deliver, cached)
+				}
 			}
 			mu.Unlock()
+
+			if deliver.HasEvaluation() {
+				return
+			}
+
+			recipientCopy := append([]string(nil), recipients...)
+			deliverCopy := *deliver
+			textCopy := text
+			hintCopy := hint
+			go func() {
+				evaluated := p.ensureEvaluated(textCopy, "", to, hintCopy, &deliverCopy)
+				mu.Lock()
+				resultsByLang[to] = langTranslation{result: evaluated, cached: cached, sameLanguage: sameLanguage}
+				mu.Unlock()
+				for _, userID := range recipientCopy {
+					p.publishTranslationEvaluated(userID, post.Id, evaluated, false)
+				}
+			}()
 		}(targetLang, users)
 	}
 
 	wg.Wait()
+
+	hint := strings.TrimSpace(hintLanguage)
+	if hint == "" {
+		hint = p.getUserTargetLanguage(post.UserId)
+	}
+	for lang, lt := range resultsByLang {
+		if lt.result == nil || lt.result.HasEvaluation() {
+			continue
+		}
+		evaluated := p.ensureEvaluated(text, "", lang, hint, lt.result)
+		lt.result = evaluated
+		resultsByLang[lang] = lt
+	}
+
+	if summary := p.buildAuthorDeliverySummary(post.Id, post.UserId, post.ChannelId, text, hintLanguage, resultsByLang); summary != nil {
+		p.publishAuthorDeliverySummary(post.UserId, summary)
+	} else {
+		p.publishAuthorDeliveryComplete(post.UserId, post.Id)
+	}
 }
 
 func (p *Plugin) getChannelMemberUserIDs(channelID string) []string {
@@ -146,7 +188,59 @@ func (p *Plugin) getChannelMemberUserIDs(channelID string) []string {
 		page++
 	}
 
+	if len(userIDs) > 0 {
+		return userIDs
+	}
+
+	channel, appErr := p.API.GetChannel(channelID)
+	if appErr != nil || channel == nil {
+		return userIDs
+	}
+
+	return p.getTeamMemberUserIDs(channel.TeamId)
+}
+
+func (p *Plugin) getTeamMemberUserIDs(teamID string) []string {
+	if teamID == "" {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	var userIDs []string
+
+	page := 0
+	perPage := 200
+	for {
+		members, appErr := p.API.GetTeamMembers(teamID, page, perPage)
+		if appErr != nil {
+			p.API.LogError("Failed to get team members", "team_id", teamID, "error", appErr.Error())
+			break
+		}
+		if len(members) == 0 {
+			break
+		}
+
+		for _, member := range members {
+			if _, ok := seen[member.UserId]; ok {
+				continue
+			}
+			seen[member.UserId] = struct{}{}
+			userIDs = append(userIDs, member.UserId)
+		}
+
+		if len(members) < perPage {
+			break
+		}
+		page++
+	}
+
 	return userIDs
+}
+
+type langTranslation struct {
+	result       *TranslationResult
+	cached       bool
+	sameLanguage bool
 }
 
 func isSameLanguage(detectedFrom, target string) bool {
@@ -170,15 +264,63 @@ func normalizeLangCode(code string) string {
 }
 
 func (p *Plugin) translateWithCache(text, from, to, hintLanguage string) (*TranslationResult, bool, error) {
+	return p.translateWithCacheMode(text, from, to, hintLanguage, false)
+}
+
+func (p *Plugin) translateWithCacheFast(text, from, to, hintLanguage string) (*TranslationResult, bool, error) {
+	return p.translateWithCacheMode(text, from, to, hintLanguage, true)
+}
+
+func (p *Plugin) translateDeliverWithCache(text, from, to, hintLanguage string) (*TranslationResult, bool, error) {
+	cacheKey := p.cacheKey(text, from, to, hintLanguage)
+	if cached, ok := p.getCachedTranslation(cacheKey); ok && strings.TrimSpace(cached.Translated) != "" {
+		return cached, true, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	result, err := p.callTranslationDeliverAPI(ctx, text, to, from, hintLanguage)
+	if err != nil {
+		return nil, false, err
+	}
+	if strings.TrimSpace(result.Origin) == "" {
+		result.Origin = text
+	}
+
+	p.storeCachedTranslation(cacheKey, result)
+	return result, false, nil
+}
+
+func (p *Plugin) evaluateAndPublish(text, from, to, hintLanguage string, deliver *TranslationResult, userIDs []string, postID string) {
+	if deliver == nil || len(userIDs) == 0 {
+		return
+	}
+
+	evaluated := p.ensureEvaluated(text, from, to, hintLanguage, deliver)
+	for _, userID := range userIDs {
+		p.publishTranslationEvaluated(userID, postID, evaluated, deliver.HasEvaluation())
+	}
+}
+
+func (p *Plugin) evaluateSyncEntry(userID, postID, text, from, to, hintLanguage string, deliver *TranslationResult) {
+	p.evaluateAndPublish(text, from, to, hintLanguage, deliver, []string{userID}, postID)
+}
+
+func (p *Plugin) translateWithCacheMode(text, from, to, hintLanguage string, fast bool) (*TranslationResult, bool, error) {
 	cacheKey := p.cacheKey(text, from, to, hintLanguage)
 	if cached, ok := p.getCachedTranslation(cacheKey); ok {
 		return cached, true, nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	timeout := 90 * time.Second
+	if fast {
+		timeout = 45 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	result, err := p.callTranslationAPI(ctx, text, to, from, hintLanguage, false)
+	result, err := p.callTranslationAPI(ctx, text, to, from, hintLanguage, fast)
 	if err != nil {
 		return nil, false, err
 	}

@@ -151,4 +151,36 @@ export const WHATSAPP_CHAT_CSS = `
             margin-left: auto !important;
             margin-right: 0 !important;
         }
+
+        #post-list .post .translation-speak-bar,
+        #post-list .post .translation-panel,
+        #post-list .post .translation-message-toggle {
+            pointer-events: auto !important;
+        }
+
+        #post-list .post .post__body.translation-has-toggle {
+            overflow: visible !important;
+        }
+
+        /* Long messages: lift Mattermost height cap when details are open (channel + thread RHS) */
+        .post .post__body.translation-details-open,
+        .post.translation-details-open .post__body,
+        .ThreadViewer .post .post__body.translation-details-open,
+        #threadViewer .post .post__body.translation-details-open {
+            max-height: none !important;
+            overflow: visible !important;
+        }
+
+        .post .post__body.translation-details-open .post-message__text,
+        .post .post__body.translation-details-open [data-testid="postMessageText"],
+        .ThreadViewer .post .post__body.translation-details-open .post-message__text {
+            max-height: none !important;
+            overflow: visible !important;
+        }
+
+        .post .translation-panel,
+        .ThreadViewer .post .translation-panel {
+            max-height: none !important;
+            overflow: visible !important;
+        }
 `;

@@ -6,6 +6,7 @@ import {
     formatRecordingDuration,
     isRecordingAtLimit,
     isRecordingNearLimit,
+    isRecordingTooShort,
     MAX_MEDIA_DURATION_MS,
 } from '../media_recording_limits';
 import {VoiceRecorderSession} from '../voice_recorder';
@@ -20,11 +21,12 @@ type Props = {
     draft: VoiceDraft;
     getSelectedText?: () => {start?: number | null; end?: number | null};
     updateText?: (message: string) => void;
+    speakingLanguage?: string;
 };
 
 type Status = 'idle' | 'recording' | 'paused' | 'sending';
 
-export default function VoiceNoteButton({draft}: Props) {
+export default function VoiceNoteButton({draft, speakingLanguage}: Props) {
     const [status, setStatus] = useState<Status>('idle');
     const [error, setError] = useState<string | null>(null);
     const [elapsedMs, setElapsedMs] = useState(0);
@@ -74,6 +76,10 @@ export default function VoiceNoteButton({draft}: Props) {
                 throw new Error('No channel selected.');
             }
 
+            if (isRecordingTooShort(result.durationMs)) {
+                throw new Error('Recording is too short. Hold the button for at least 2 seconds.');
+            }
+
             const audioFile = new File([result.blob], result.fileName, {type: result.mimeType});
             const fileId = await uploadChannelFile(draft.channelId, audioFile);
             await createVoicePost({
@@ -82,6 +88,7 @@ export default function VoiceNoteButton({draft}: Props) {
                 fileId,
                 transcript: result.transcript,
                 durationMs: result.durationMs,
+                speakingLanguage,
             });
 
             setStatus('idle');
@@ -91,7 +98,7 @@ export default function VoiceNoteButton({draft}: Props) {
             setStatus('idle');
             setError(err instanceof Error ? err.message : 'Failed to send voice message.');
         }
-    }, [clearTimer, draft.channelId, draft.rootId]);
+    }, [clearTimer, draft.channelId, draft.rootId, speakingLanguage]);
 
     sendRecordingRef.current = sendRecording;
 
