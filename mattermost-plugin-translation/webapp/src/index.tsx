@@ -2483,13 +2483,6 @@ function MemberLanguagesSidebar(props: Record<string, unknown>) {
     return (
         <MemberLanguagesPanel
             {...props}
-            onResyncChannel={(channelId: string) => {
-                if (!storeRef) {
-                    return;
-                }
-                const postIds = getChannelPosts(storeRef.getState(), channelId).map((post) => post.id);
-                void resyncCurrentChannelTranslations(channelId, postIds);
-            }}
         />
     );
 }

@@ -1,5 +1,5 @@
 import {listGoogleLanguages} from './google.js';
-import {toSpeechBcp47} from './speech_bcp47.js';
+import {filterGoogleSpeechCandidates, toSpeechBcp47} from './speech_bcp47.js';
 
 let cachedSpeechBcp47: string[] | null = null;
 let cachedRotations: string[][] | null = null;
@@ -26,7 +26,9 @@ export async function getAllSpeechBcp47Codes(): Promise<string[]> {
 
   try {
     const languages = await listGoogleLanguages();
-    cachedSpeechBcp47 = uniqueSpeechBcp47(languages.map((entry) => entry.code));
+    cachedSpeechBcp47 = uniqueSpeechBcp47(
+      filterGoogleSpeechCandidates(languages.map((entry) => entry.code)),
+    );
   } catch {
     cachedSpeechBcp47 = uniqueSpeechBcp47(Object.keys({
       en: 'en-US',
@@ -94,7 +96,7 @@ export async function getGlobalSpeechRotations(): Promise<string[][]> {
 }
 
 export function buildChannelRotations(languageCandidates: string[]): string[][] {
-  return batchIntoRotations(languageCandidates);
+  return batchIntoRotations(filterGoogleSpeechCandidates(languageCandidates));
 }
 
 export async function preloadSpeechLanguageCatalog(): Promise<number> {

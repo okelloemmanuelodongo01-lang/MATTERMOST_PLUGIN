@@ -102,6 +102,34 @@ const SPEECH_BCP47: Record<string, string> = {
     lg: 'lg-UG',
 };
 
+/**
+ * Languages Google Translate supports but Google Speech V1 (latest_long/latest_short) does not.
+ * These use Whisper for STT instead. Luganda is V2/chirp_2 only on Google.
+ */
+export const WHISPER_PREFERRED_STT_BASES = new Set([
+    'lg', // Luganda
+    'ln', // Lingala
+    'ha', // Hausa
+    'yo', // Yoruba
+    'ig', // Igbo
+    'sn', // Shona
+    'ny', // Chichewa
+    'mg', // Malagasy
+    'ceb', // Cebuano
+    'haw', // Hawaiian
+    'mi', // Maori
+    'sm', // Samoan
+]);
+
+export function isWhisperPreferredStt(languageCode?: string): boolean {
+    const base = normalizeSpeechLanguageCode(languageCode);
+    return base !== '' && WHISPER_PREFERRED_STT_BASES.has(base);
+}
+
+export function filterGoogleSpeechCandidates(codes: string[]): string[] {
+    return codes.filter((code) => !isWhisperPreferredStt(code));
+}
+
 export function toSpeechBcp47(languageCode?: string): string | undefined {
     const raw = (languageCode || '').trim().toLowerCase();
     if (!raw) {
@@ -125,7 +153,7 @@ export function toSpeechBcp47(languageCode?: string): string | undefined {
         return SPEECH_BCP47[base];
     }
 
-    return `${base}-${base.toUpperCase()}`;
+    return undefined;
 }
 
 /** ISO 639-1 code for Whisper forced-language mode. */

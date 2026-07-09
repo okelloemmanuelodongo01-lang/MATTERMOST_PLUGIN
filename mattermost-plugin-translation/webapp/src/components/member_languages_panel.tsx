@@ -72,8 +72,6 @@ type Props = {
 
     onReadAloudModeSaved: (mode: ReadAloudMode) => void;
 
-    onResyncChannel?: (channelId: string) => void;
-
 };
 
 
@@ -85,8 +83,6 @@ type State = {
     loading: boolean;
 
     error: string;
-
-    savingLanguage: boolean;
 
     savingVoice: boolean;
 
@@ -140,7 +136,6 @@ class MemberLanguagesPanel extends React.PureComponent<Props, State> {
             members: [],
             loading: true,
             error: '',
-            savingLanguage: false,
             savingVoice: false,
             savingReadAloudMode: false,
             voiceGender: props.myVoiceGender,
@@ -372,27 +367,24 @@ class MemberLanguagesPanel extends React.PureComponent<Props, State> {
 
 
 
-    handleLanguageChange = async (language: string) => {
-        const {currentUserId, onLanguageSaved, onResyncChannel, channelId} = this.props;
-        this.setState({savingLanguage: true, error: ''});
+    handleLanguageChange = (language: string) => {
+        const {currentUserId, onLanguageSaved} = this.props;
+        this.setState({error: ''});
 
         if (currentUserId) {
             onLanguageSaved(language, currentUserId);
         }
 
-        try {
-            await this.savePreferences({target_language: language});
-            clearSpeakAudioCache();
-            void this.loadMembers();
-            if (channelId) {
-                onResyncChannel?.(channelId);
-            }
-        } catch (error) {
-            const message = error instanceof Error ? error.message : 'Failed to save language';
-            this.setState({error: message});
-        } finally {
-            this.setState({savingLanguage: false});
-        }
+        clearSpeakAudioCache();
+
+        void this.savePreferences({target_language: language})
+            .then(() => {
+                void this.loadMembers();
+            })
+            .catch((error) => {
+                const message = error instanceof Error ? error.message : 'Failed to save language';
+                this.setState({error: message});
+            });
     };
 
     handleVoiceGenderChange = async (gender: VoiceGender) => {
@@ -438,7 +430,7 @@ class MemberLanguagesPanel extends React.PureComponent<Props, State> {
 
         const {myReceiveLanguage, userLanguages, currentUserId} = this.props;
 
-        const {members, loading, error, savingLanguage, savingVoice, savingReadAloudMode, voiceGender, readAloudMode} = this.state;
+        const {members, loading, error, savingVoice, savingReadAloudMode, voiceGender, readAloudMode} = this.state;
 
         const displayMembers = members.map((member) => ({
 
@@ -471,9 +463,7 @@ class MemberLanguagesPanel extends React.PureComponent<Props, State> {
 
                             value={myReceiveLanguage}
 
-                            disabled={savingLanguage}
-
-                            onChange={(language) => void this.handleLanguageChange(language)}
+                            onChange={(language) => this.handleLanguageChange(language)}
 
                         />
 

@@ -1,5 +1,5 @@
 import {float32ToWav} from './audio_wav.js';
-import {GOOGLE_SPEECH_SYNC_MAX_SECONDS, normalizeSpeechLanguageCode, toSpeechBcp47} from './speech_bcp47.js';
+import {GOOGLE_SPEECH_SYNC_MAX_SECONDS, filterGoogleSpeechCandidates, isWhisperPreferredStt, normalizeSpeechLanguageCode, toSpeechBcp47} from './speech_bcp47.js';
 import {fetchWithRetry} from './fetch_retry.js';
 import {getSampledSpeechRotations} from './speech_language_catalog.js';
 import {detectLanguageWithGoogle, isGoogleTranslateEnabled} from './google.js';
@@ -14,7 +14,7 @@ const AUTO_DETECT_ROTATIONS: string[][] = [
   ['en-US', 'fr-FR', 'ja-JP', 'ar-SA'],
   ['sw-KE', 'de-DE', 'es-ES', 'pt-BR'],
   ['hi-IN', 'it-IT', 'ru-RU', 'zh-CN'],
-  ['lg-UG', 'ha-NG', 'ko-KR', 'nl-NL'],
+  ['sw-KE', 'am-ET', 'rw-RW', 'zu-ZA'],
 ];
 
 const CHUNK_SECONDS = 50;
@@ -64,7 +64,7 @@ export function buildLanguageConfig(languageHint?: string, languageCandidates?: 
     };
   }
 
-  const fromChannel = uniqueBcp47(languageCandidates || []);
+  const fromChannel = uniqueBcp47(filterGoogleSpeechCandidates(languageCandidates || []));
   if (fromChannel.length > 0) {
     return {
       languageCode: fromChannel[0],
@@ -366,8 +366,12 @@ export async function transcribeWithGoogleSpeech(
 ): Promise<{text: string; detected_language: string; engine: string; confidence: number}> {
   const decodedDuration = pcmSamples && pcmSamples.length > 0 ? pcmSamples.length / 16000 : 0;
   const duration = durationSeconds || decodedDuration || 0;
-  const explicit = Boolean(toSpeechBcp47(languageHint));
 
+  if (isWhisperPreferredStt(languageHint)) {
+    throw new Error(`Google Speech V1 does not support ${toSpeechBcp47(languageHint) || languageHint}; use Whisper for this language.`);
+  }
+
+  const explicit = Boolean(toSpeechBcp47(languageHint));
   const useWav = pcmSamples && pcmSamples.length > 0;
   const audioBuffer = useWav ? float32ToWav(pcmSamples, 16000) : buffer;
   const audioMime = useWav ? 'audio/wav' : mimeType;

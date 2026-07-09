@@ -29,7 +29,7 @@ if (-not (Test-Path "webapp/dist/main.js")) {
 }
 
 $pluginId = "com.transchecker.translation"
-$version = "3.5.5"
+$version = "3.5.7"
 $staging = "dist/staging/$pluginId"
 Remove-Item -Recurse -Force "dist/staging" -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path "$staging/server/dist", "$staging/webapp/dist", "$staging/assets" | Out-Null

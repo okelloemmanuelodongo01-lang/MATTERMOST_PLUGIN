@@ -3,7 +3,7 @@ import decode, {type AudioData} from 'audio-decode';
 
 import {isGoogleSpeechEnabled, transcribeWithGoogleSpeech} from './google_speech.js';
 import {detectLanguageWithGoogle, isGoogleTranslateEnabled} from './google.js';
-import {normalizeSpeechLanguageCode, toWhisperLanguage} from './speech_bcp47.js';
+import {isWhisperPreferredStt, normalizeSpeechLanguageCode, toWhisperLanguage} from './speech_bcp47.js';
 import {preprocessForStt} from './audio_preprocess.js';
 import {scriptLanguageHint} from './spoken_language_hints.js';
 
@@ -173,6 +173,9 @@ function scoreTranscription(result: TranscriptionResult, preferredLang?: string)
   if (result.engine.startsWith('google')) {
     score += 14;
   }
+  if (result.engine.includes('whisper') && preferredLang && isWhisperPreferredStt(preferredLang)) {
+    score += 20;
+  }
   if (result.engine.includes('whisper-auto')) {
     score += 6;
   }
@@ -226,10 +229,30 @@ export async function transcribeAudioBuffer(
 
   const results: TranscriptionResult[] = [];
   const googleEnabled = isGoogleSpeechEnabled();
+  const whisperHint = languageHint || languageCandidates.find((code) => isWhisperPreferredStt(code)) || '';
+  const skipGoogleForWhisperLang = isWhisperPreferredStt(whisperHint);
+
+  // Phase 0 — Whisper with forced language for codes Google Speech V1 does not support (e.g. Luganda).
+  if (samples && samples.length > 0 && skipGoogleForWhisperLang) {
+    try {
+      const whisperForced = await transcribeWithWhisper(samples, whisperHint, durationSeconds);
+      results.push(whisperForced);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Whisper forced-language failed';
+      console.warn(message);
+      try {
+        const whisperAuto = await transcribeWithWhisper(samples, undefined, durationSeconds);
+        results.push(whisperAuto);
+      } catch (autoError) {
+        const autoMessage = autoError instanceof Error ? autoError.message : 'Whisper auto-detect failed';
+        console.warn(autoMessage);
+      }
+    }
+  }
 
   // Phase 1 — Whisper auto-detect (fallback acoustic engine).
   let whisperDetected = '';
-  if (samples && samples.length > 0) {
+  if (samples && samples.length > 0 && !skipGoogleForWhisperLang) {
     try {
       const whisperAuto = await transcribeWithWhisper(samples, undefined, durationSeconds);
       results.push(whisperAuto);
@@ -242,8 +265,8 @@ export async function transcribeAudioBuffer(
 
   const googleHint = languageHint || whisperDetected || '';
 
-  // Phase 2 — Google Speech (channel candidates + auto rotations).
-  if (googleEnabled && durationSeconds > 0) {
+  // Phase 2 — Google Speech (channel candidates + auto rotations). Skip for Whisper-only languages.
+  if (googleEnabled && durationSeconds > 0 && !skipGoogleForWhisperLang) {
     try {
       results.push(await transcribeWithGoogleSpeech(
         buffer,
@@ -261,7 +284,7 @@ export async function transcribeAudioBuffer(
 
     // Phase 3 — Polish with explicit locale once spoken language is known.
     const refineLang = googleHint || results.find((entry) => entry.detected_language)?.detected_language || '';
-    if (refineLang && results.length > 0) {
+    if (refineLang && results.length > 0 && !isWhisperPreferredStt(refineLang)) {
       const bestSoFar = pickBestTranscription(results, refineLang);
       if (bestSoFar.text.length < 12 || !languageMatchesHint(bestSoFar.detected_language, refineLang)) {
         try {
