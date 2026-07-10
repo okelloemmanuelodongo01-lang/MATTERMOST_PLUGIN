@@ -1,0 +1,48 @@
+databases:
+  - name: mattermost-db
+    databaseName: mattermost
+    user: mmuser
+    plan: basic-256mb
+    postgresMajorVersion: "16"
+
+services:
+  - type: web
+    name: mattermost
+    runtime: image
+    plan: starter
+    region: oregon
+    image:
+      url: docker.io/mattermost/mattermost-team-edition:10.5.0
+    disk:
+      name: mattermost-data
+      mountPath: /mattermost/data
+      sizeGB: 10
+    healthCheckPath: /api/v4/system/ping
+    envVars:
+      - key: MM_SQLSETTINGS_DRIVERNAME
+        value: postgres
+      - key: MM_SQLSETTINGS_DATASOURCE
+        fromDatabase:
+          name: mattermost-db
+          property: connectionString
+      - key: MM_CONFIG
+        fromDatabase:
+          name: mattermost-db
+          property: connectionString
+      - key: MM_SERVICESETTINGS_SITEURL
+        fromService:
+          type: web
+          name: mattermost
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: MM_PLUGINSETTINGS_DIRECTORY
+        value: /mattermost/data/plugins
+      - key: MM_PLUGINSETTINGS_CLIENTDIRECTORY
+        value: /mattermost/data/client/plugins
+      - key: MM_PLUGINSETTINGS_ENABLE
+        value: "true"
+      - key: MM_PLUGINSETTINGS_ENABLEUPLOADS
+        value: "true"
+      - key: MM_FILESETTINGS_MAXFILESIZE
+        value: "52428800"
+      - key: MM_LOGSETTINGS_CONSOLELEVEL
+        value: INFO
